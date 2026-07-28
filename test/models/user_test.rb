@@ -1,7 +1,7 @@
 require "test_helper"
 
 class UserTest < ActiveSupport::TestCase
-  # Use a password that meets all requirements: 12+ chars, uppercase, lowercase, number
+  # Passwords only need to be at least 4 characters
   VALID_PASSWORD = "Password123!".freeze
 
   test "downcases and strips username" do
@@ -21,24 +21,21 @@ class UserTest < ActiveSupport::TestCase
   end
 
   test "validates password minimum length" do
-    user = User.new(name: "Test", username: "testuser", password: "Short1")
+    user = User.new(name: "Test", username: "testuser", password: "abc")
     assert_not user.valid?
     assert user.errors[:password].any?
   end
 
-  test "validates password complexity" do
-    # Missing uppercase
-    user = User.new(name: "Test", username: "testuser", password: "password12345")
-    assert_not user.valid?
-    assert user.errors[:password].any?
+  test "allows short simple passwords at the minimum length" do
+    user = User.new(name: "Test", username: "testuser", password: "abcd")
+    assert user.valid?
+  end
 
-    # Missing lowercase
-    user = User.new(name: "Test", username: "testuser", password: "PASSWORD12345")
-    assert_not user.valid?
-
-    # Missing number
-    user = User.new(name: "Test", username: "testuser", password: "PasswordOnly!")
-    assert_not user.valid?
+  test "does not require password complexity" do
+    [ "password12345", "PASSWORD12345", "PasswordOnly!" ].each do |password|
+      user = User.new(name: "Test", username: "testuser", password: password)
+      assert user.valid?, "expected #{password.inspect} to be accepted"
+    end
   end
 
   test "locked? returns true when locked_until is in future" do

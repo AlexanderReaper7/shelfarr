@@ -3,7 +3,7 @@
 require "test_helper"
 
 class ProfilesControllerTest < ActionDispatch::IntegrationTest
-  # Passwords must meet requirements: 12+ chars, uppercase, lowercase, number
+  # Passwords only need to be at least 4 characters
   FIXTURE_PASSWORD = "Password123!".freeze
   NEW_VALID_PASSWORD = "NewPassword456!".freeze
 
@@ -205,17 +205,18 @@ class ProfilesControllerTest < ActionDispatch::IntegrationTest
   test "update_password requires minimum length" do
     patch update_password_profile_path, params: {
       current_password: FIXTURE_PASSWORD,
-      user: { password: "Short1", password_confirmation: "Short1" }
+      user: { password: "abc", password_confirmation: "abc" }
     }
     assert_response :unprocessable_entity
   end
 
-  test "update_password requires complexity" do
+  test "update_password does not require complexity" do
     patch update_password_profile_path, params: {
       current_password: FIXTURE_PASSWORD,
       user: { password: "alllowercase123", password_confirmation: "alllowercase123" }
     }
-    assert_response :unprocessable_entity
+    assert_redirected_to profile_path
+    assert @user.reload.authenticate("alllowercase123")
   end
 
   test "link_oidc requires configured OIDC" do

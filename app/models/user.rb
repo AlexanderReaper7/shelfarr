@@ -29,12 +29,7 @@ class User < ApplicationRecord
     scope: :oidc_provider,
     conditions: -> { where(deleted_at: nil) }
   }, allow_nil: true
-  validates :password, length: { minimum: 12 },
-    format: {
-      with: /\A(?=.*[a-z])(?=.*[A-Z])(?=.*\d).+\z/,
-      message: "must include at least one lowercase letter, one uppercase letter, and one number"
-    },
-    if: -> { password.present? && !oidc_user? }
+  validates :password, length: { minimum: 4 }, if: -> { password.present? && !oidc_user? }
 
   before_create :set_admin_if_first_user
 
