@@ -4,6 +4,8 @@ require "test_helper"
 require "fiddle"
 
 class FileCopyServiceTest < ActiveSupport::TestCase
+  include SyntheticLibraryModesTestHelper
+
   setup do
     @tmp_dir = Dir.mktmpdir
     @src_file = File.join(@tmp_dir, "source.txt")
@@ -125,8 +127,66 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     end
 
     assert File.directory?(directory)
-    assert_includes FileCopyService::SAFE_LIBRARY_DIRECTORY_MODES,
+    assert_includes FileCopyService::LIBRARY_DIRECTORY_MODES,
       File.stat(directory).mode & 0o777
+  end
+
+  test "ensure_directory accepts a synthetic Windows ACL mode" do
+    directory = File.join(@dest_dir, "windows-mode-directory")
+
+    with_synthetic_library_modes(root: @dest_dir, file_mode: 0o666, directory_mode: 0o777) do
+      FileCopyService.ensure_directory(directory, root: @dest_dir)
+    end
+
+    assert File.directory?(directory)
+    assert_equal 0o777, File.stat(directory).mode & 0o7777
+  end
+
+  test "cp_noreplace supports synthetic Windows ACL modes and compatibility publication" do
+    destination = File.join(@dest_dir, "windows-mode.txt")
+
+    with_synthetic_library_modes(
+      root: @dest_dir,
+      file_mode: 0o666,
+      directory_mode: 0o777,
+      fchmod_error: Errno::EOPNOTSUPP
+    ) do
+      without_atomic_file_publication do
+        FileCopyService.cp_noreplace(
+          @src_file,
+          destination,
+          root: @dest_dir,
+          allow_compatibility_fallback: true
+        )
+      end
+    end
+
+    assert_equal "test content", File.binread(destination)
+    assert_equal 0o666, File.stat(destination).mode & 0o7777
+    assert_empty Dir.children(@dest_dir) - [ "windows-mode.txt" ]
+  end
+
+  test "private directories still reject synthetic broad modes" do
+    directory = File.join(@dest_dir, "private-directory")
+
+    with_synthetic_library_modes(root: @dest_dir, file_mode: 0o666, directory_mode: 0o777) do
+      assert_raises(FileCopyService::UnsafeFilePermissionsError) do
+        FileCopyService.secure_private_directory!(directory, root: @dest_dir)
+      end
+    end
+  end
+
+  test "library publication rejects synthetic modes with special bits" do
+    destination = File.join(@dest_dir, "special-mode.txt")
+
+    with_synthetic_library_modes(root: @dest_dir, file_mode: 0o4777, directory_mode: 0o1777) do
+      assert_raises(FileCopyService::UnsafeFilePermissionsError) do
+        FileCopyService.cp_noreplace(@src_file, destination, root: @dest_dir)
+      end
+    end
+
+    assert_not File.exist?(destination)
+    assert_equal "test content", File.binread(@src_file)
   end
 
   test "ensure_directory does not chmod the caller-provided root" do
@@ -145,7 +205,7 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     unsafe_fchmod = lambda do |descriptor, mode|
       handle = File.for_fd(descriptor, "rb", autoclose: false)
       if handle.stat.file? && mode == FileCopyService::LIBRARY_FILE_MODE
-        handle.chmod(0o644)
+        handle.chmod(0o444)
       else
         real_fchmod.call(descriptor, mode)
       end
@@ -711,6 +771,28 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     assert_empty Dir.children(@dest_dir)
   end
 
+  test "cleanup_interrupted_copies recovers a synthetic-mode copy lock" do
+    token = "f" * 32
+    temporary = File.join(@dest_dir, ".shelfarr-copy-#{token}.tmp")
+    File.binwrite(temporary, "interrupted bytes")
+    temporary_stat = File.stat(temporary)
+    lock = write_copy_lock(token, temporary_stat)
+    File.chmod(0o666, temporary)
+    File.chmod(0o666, lock)
+
+    with_synthetic_library_modes(
+      root: @dest_dir,
+      file_mode: 0o666,
+      directory_mode: 0o777
+    ) do
+      FileCopyService.cleanup_interrupted_copies(@dest_dir, root: @dest_dir)
+    end
+
+    assert_not File.exist?(temporary)
+    assert_not File.exist?(lock)
+    assert_empty Dir.children(@dest_dir)
+  end
+
   test "cleanup_interrupted_copies recovers a crash-left private quarantine" do
     token = "a" * 32
     temporary = File.join(@dest_dir, ".shelfarr-copy-#{token}.tmp")
@@ -726,6 +808,31 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     assert_not File.exist?(temporary)
     assert_not File.exist?(lock)
     assert_not File.exist?(quarantine)
+  end
+
+  test "cleanup_interrupted_copies recovers a synthetic-mode quarantine" do
+    token = "d" * 32
+    temporary = File.join(@dest_dir, ".shelfarr-copy-#{token}.tmp")
+    File.binwrite(temporary, "interrupted bytes")
+    temporary_stat = File.stat(temporary)
+    quarantine = copy_quarantine_path(temporary_stat, "e" * 32)
+    Dir.mkdir(quarantine, 0o700)
+    entry = File.join(quarantine, FileCopyService::COPY_QUARANTINE_ENTRY)
+    File.rename(temporary, entry)
+    File.chmod(0o666, entry)
+    File.chmod(0o777, quarantine)
+
+    with_synthetic_library_modes(
+      root: @dest_dir,
+      file_mode: 0o666,
+      directory_mode: 0o777
+    ) do
+      FileCopyService.cleanup_interrupted_copies(@dest_dir, root: @dest_dir)
+    end
+
+    assert_not File.exist?(entry)
+    assert_not File.exist?(quarantine)
+    assert_empty Dir.children(@dest_dir)
   end
 
   test "cleanup_interrupted_copies retains a fresh empty quarantine" do
@@ -757,7 +864,7 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     mode_quarantine = copy_quarantine_path(expected_stat, "8" * 32)
     Dir.mkdir(owner_quarantine, 0o700)
     Dir.mkdir(mode_quarantine, 0o700)
-    File.chmod(0o750, mode_quarantine)
+    File.chmod(0o1777, mode_quarantine)
     stale_time = Time.now - FileCopyService::COPY_QUARANTINE_STALE_AGE - 60
     File.utime(stale_time, stale_time, owner_quarantine)
     File.utime(stale_time, stale_time, mode_quarantine)
@@ -1675,6 +1782,38 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     assert_not FileCopyService.secure_library_file_mode?(destination, root: @dest_dir)
   end
 
+  test "secure_library_file_mode rejects a broad collision when a mode probe remains private" do
+    destination = File.join(@dest_dir, "independent-copy.txt")
+    File.binwrite(destination, "independent bytes")
+    File.chmod(0o644, destination)
+
+    FileCopyService.stub(:native_fchmod, ->(*) { raise Errno::EOPNOTSUPP }) do
+      assert_not FileCopyService.secure_library_file_mode?(destination, root: @dest_dir)
+    end
+
+    assert_equal 0o644, File.stat(destination).mode & 0o7777
+    assert_empty Dir.children(@dest_dir) - [ "independent-copy.txt" ]
+  end
+
+  test "hardlink verification rejects a broad collision when a mode probe remains private" do
+    destination = File.join(@dest_dir, "independent-copy.txt")
+    FileUtils.cp(@src_file, destination)
+    File.chmod(0o644, destination)
+
+    snapshot = FileCopyService.stub(:native_fchmod, ->(*) { raise Errno::EOPNOTSUPP }) do
+      FileCopyService.verified_library_file_snapshot(
+        @src_file,
+        destination,
+        root: @dest_dir,
+        hardlink_mode: true
+      )
+    end
+
+    assert_nil snapshot
+    assert_equal 0o644, File.stat(destination).mode & 0o7777
+    assert_empty Dir.children(@dest_dir) - [ "independent-copy.txt" ]
+  end
+
   test "secure_library_file_mode rejects a destination swap during revalidation" do
     destination = File.join(@dest_dir, "library.txt")
     displaced = File.join(@dest_dir, "displaced-library.txt")
@@ -1886,7 +2025,11 @@ class FileCopyServiceTest < ActiveSupport::TestCase
     nested = File.join(source_root_path, "nested")
     invalid_filename = "chapter-\xFF.mp3".b
     FileUtils.mkdir_p(nested)
-    File.binwrite(File.join(nested, invalid_filename), "chapter")
+    begin
+      File.binwrite(File.join(nested, invalid_filename), "chapter")
+    rescue Errno::EILSEQ
+      skip "host filesystem rejects invalid UTF-8 filenames"
+    end
 
     error = assert_raises(FileCopyService::UnsafePathError) do
       FileCopyService.snapshot_source_root(source_root_path)
