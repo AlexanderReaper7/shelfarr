@@ -1,0 +1,105 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Upstream repository to merge from (owner/name)
+        required: true
+        default: Pedro-Revez-Silva/shelfarr
+      upstream_branch:
+        description: Upstream branch to merge from
+        required: true
+        default: main
+      target_branch:
+        description: Branch that tracks upstream
+        required: true
+        default: main
+      personal_branch:
+        description: Branch that receives the merged upstream changes
+        required: true
+        default: personal-changes
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          fetch-depth: 0
+          # GITHUB_TOKEN is refused when a push touches .github/workflows/**, so
+          # syncing upstream changes to CI needs a PAT with the workflow scope.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          # Make the read-only intent structural: any push to upstream fails on
+          # the URL rather than relying on nothing ever attempting one.
+          git remote set-url --push upstream DISABLED
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+
+      # main tracks upstream but carries fork commits of its own, so this merge
+      # can conflict just like the personal one.
+      - name: Merge upstream into mirror branch
+        id: merge_mirror
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          # The fallback PR is opened from a branch in this repository, never
+          # from the upstream one.
+          .github/scripts/sync-merge.sh \
+            "upstream/${UPSTREAM_BRANCH}" \
+            "${TARGET_BRANCH}" \
+            "sync/upstream-${UPSTREAM_BRANCH}" \
+            mirror
+
+      # Runs even if the merge above needed a PR, so the personal branch still
+      # picks up whatever main already has.
+      - name: Merge mirror branch into personal branch
+        if: ${{ !cancelled() }}
+        id: merge_personal
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PERSONAL_BRANCH: ${{ inputs.personal_branch }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+        run: |
+          .github/scripts/sync-merge.sh \
+            "${TARGET_BRANCH}" \
+            "${PERSONAL_BRANCH}" \
+            "${TARGET_BRANCH}" \
+            personal
+
+      - name: Summary
+        if: always()
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PERSONAL_BRANCH: ${{ inputs.personal_branch }}
+          MIRROR_STATUS: ${{ steps.merge_mirror.outputs.mirror_status }}
+          MIRROR_PR: ${{ steps.merge_mirror.outputs.mirror_pr_url }}
+          PERSONAL_STATUS: ${{ steps.merge_personal.outputs.personal_status }}
+          PERSONAL_PR: ${{ steps.merge_personal.outputs.personal_pr_url }}
+        run: .github/scripts/sync-summary.sh
