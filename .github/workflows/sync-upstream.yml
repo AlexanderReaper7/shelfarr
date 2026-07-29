@@ -37,6 +37,9 @@ jobs:
         uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
         with:
           fetch-depth: 0
+          # GITHUB_TOKEN is refused when a push touches .github/workflows/**, so
+          # syncing upstream changes to CI needs a PAT with the workflow scope.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
 
       - name: Configure git identity
         run: |
@@ -56,14 +59,17 @@ jobs:
       - name: Merge upstream into mirror branch
         id: merge_mirror
         env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
           UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
         run: |
+          # Open the fallback PR straight from the upstream repository rather
+          # than pushing a copy of its branch here.
           .github/scripts/sync-merge.sh \
             "upstream/${UPSTREAM_BRANCH}" \
             "${TARGET_BRANCH}" \
-            "sync/upstream-${UPSTREAM_BRANCH}" \
+            "${UPSTREAM_REPO%%/*}:${UPSTREAM_BRANCH}" \
             mirror
 
       # Runs even if the merge above needed a PR, so the personal branch still
@@ -74,7 +80,7 @@ jobs:
         env:
           TARGET_BRANCH: ${{ inputs.target_branch }}
           PERSONAL_BRANCH: ${{ inputs.personal_branch }}
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
         run: |
           .github/scripts/sync-merge.sh \
             "${TARGET_BRANCH}" \

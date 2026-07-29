@@ -57,10 +57,18 @@ fi
 
 echo "::warning::Conflicts remain in ${target_branch} after rerere; opening a pull request."
 
-# Give the PR a head branch inside this repository when the source is external.
-if [ "${source_ref}" != "${pr_head}" ]; then
-  git push --force origin "${source_ref}:refs/heads/${pr_head}"
-fi
+# A pr_head of the form "owner:branch" already exists in another repository of
+# this fork network, so GitHub can open the PR against it directly. Pushing a
+# copy would be worse than redundant: GITHUB_TOKEN is refused outright when the
+# commits touch .github/workflows/**, which upstream commits routinely do.
+case "${pr_head}" in
+  *:*) ;;
+  *)
+    if [ "${source_ref}" != "${pr_head}" ]; then
+      git push --force origin "${source_ref}:refs/heads/${pr_head}"
+    fi
+    ;;
+esac
 
 BASE_BRANCH="${target_branch}" \
 HEAD_BRANCH="${pr_head}" \
