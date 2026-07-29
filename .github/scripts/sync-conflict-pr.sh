@@ -25,7 +25,7 @@ EOF
   exit 0
 fi
 
-url="$(gh pr create --base "${BASE_BRANCH}" --head "${HEAD_BRANCH}" \
+if ! url="$(gh pr create --base "${BASE_BRANCH}" --head "${HEAD_BRANCH}" \
   --title "Sync ${HEAD_BRANCH} into ${BASE_BRANCH}" \
   --body "$(cat <<EOF
 Automated sync could not merge \`${HEAD_BRANCH}\` into \`${BASE_BRANCH}\`.
@@ -51,6 +51,17 @@ Exporting the rerere cache lets the next sync replay this resolution on its own.
 
 Triggered by run [\`${GITHUB_RUN_ID}\`](${run_url}).
 EOF
-)")"
+)")"; then
+  case "${HEAD_BRANCH}" in
+    *:*)
+      echo "::error::Could not open a pull request from ${HEAD_BRANCH}. GITHUB_TOKEN cannot create a pull request whose head branch lives in another repository. Add a personal access token with the 'repo' and 'workflow' scopes as the SYNC_TOKEN secret."
+      ;;
+    *)
+      echo "::error::Could not open a pull request from ${HEAD_BRANCH} into ${BASE_BRANCH}."
+      ;;
+  esac
+  echo "${OUTPUT_KEY}_pr_url=(could not be created -- see the log)" >> "${GITHUB_OUTPUT}"
+  exit 1
+fi
 
 echo "${OUTPUT_KEY}_pr_url=${url}" >> "${GITHUB_OUTPUT}"
