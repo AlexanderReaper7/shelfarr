@@ -52,7 +52,10 @@ jobs:
           UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
         run: |
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          git fetch upstream "${UPSTREAM_BRANCH}"
+          # Make the read-only intent structural: any push to upstream fails on
+          # the URL rather than relying on nothing ever attempting one.
+          git remote set-url --push upstream DISABLED
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
 
       # main tracks upstream but carries fork commits of its own, so this merge
       # can conflict just like the personal one.
@@ -64,12 +67,12 @@ jobs:
           TARGET_BRANCH: ${{ inputs.target_branch }}
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
         run: |
-          # Open the fallback PR straight from the upstream repository rather
-          # than pushing a copy of its branch here.
+          # The fallback PR is opened from a branch in this repository, never
+          # from the upstream one.
           .github/scripts/sync-merge.sh \
             "upstream/${UPSTREAM_BRANCH}" \
             "${TARGET_BRANCH}" \
-            "${UPSTREAM_REPO%%/*}:${UPSTREAM_BRANCH}" \
+            "sync/upstream-${UPSTREAM_BRANCH}" \
             mirror
 
       # Runs even if the merge above needed a PR, so the personal branch still

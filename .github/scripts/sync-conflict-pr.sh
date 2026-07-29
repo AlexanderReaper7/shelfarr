@@ -52,14 +52,7 @@ Exporting the rerere cache lets the next sync replay this resolution on its own.
 Triggered by run [\`${GITHUB_RUN_ID}\`](${run_url}).
 EOF
 )")"; then
-  case "${HEAD_BRANCH}" in
-    *:*)
-      echo "::error::Could not open a pull request from ${HEAD_BRANCH}. GITHUB_TOKEN cannot create a pull request whose head branch lives in another repository. Add a personal access token with the 'repo' and 'workflow' scopes as the SYNC_TOKEN secret."
-      ;;
-    *)
-      echo "::error::Could not open a pull request from ${HEAD_BRANCH} into ${BASE_BRANCH}."
-      ;;
-  esac
+  echo "::error::Could not open a pull request from ${HEAD_BRANCH} into ${BASE_BRANCH}. If the push of ${HEAD_BRANCH} was rejected for touching .github/workflows/**, add a personal access token with the 'repo' and 'workflow' scopes as the SYNC_TOKEN secret."
   echo "${OUTPUT_KEY}_pr_url=(could not be created -- see the log)" >> "${GITHUB_OUTPUT}"
   exit 1
 fi
