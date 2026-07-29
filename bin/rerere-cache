@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Move recorded conflict resolutions between git's private .git/rr-cache and a
+# tracked directory, so the Sync Upstream workflow can replay resolutions that
+# were made locally.
+#
+#   bin/rerere-cache enable   turn on rerere for this clone
+#   bin/rerere-cache import   .rerere-cache/ -> .git/rr-cache/   (CI, fresh clones)
+#   bin/rerere-cache export   .git/rr-cache/ -> .rerere-cache/   (after resolving)
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+git_dir="$(cd "$repo_root" && git rev-parse --git-dir && cd - >/dev/null)"
+case "$git_dir" in
+  /*) ;;
+  *) git_dir="${repo_root}/${git_dir}" ;;
+esac
+
+tracked="${repo_root}/.rerere-cache"
+live="${git_dir}/rr-cache"
+
+# Only preimage/postimage are the durable resolution; thisimage is scratch state
+# left behind by an in-progress merge.
+copy_tree() {
+  local from="$1" to="$2" entry name
+  for entry in "$from"/*/; do
+    [ -d "$entry" ] || continue
+    name="$(basename "$entry")"
+    mkdir -p "${to}/${name}"
+    for f in preimage postimage; do
+      [ -f "${entry}${f}" ] && cp "${entry}${f}" "${to}/${name}/${f}"
+    done
+  done
+}
+
+case "${1:-}" in
+  enable)
+    git config rerere.enabled true
+    git config rerere.autoUpdate true
+    echo "rerere enabled (autoUpdate on) for $repo_root"
+    ;;
+  import)
+    if [ ! -d "$tracked" ]; then
+      echo "no $tracked to import; nothing to do"
+      exit 0
+    fi
+    mkdir -p "$live"
+    copy_tree "$tracked" "$live"
+    echo "imported $(find "$live" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') resolution(s) into $live"
+    ;;
+  export)
+    if [ ! -d "$live" ]; then
+      echo "no $live yet; resolve a conflict first"
+      exit 0
+    fi
+    mkdir -p "$tracked"
+    copy_tree "$live" "$tracked"
+    echo "exported $(find "$tracked" -mindepth 1 -maxdepth 1 -type d | wc -l | tr -d ' ') resolution(s) into $tracked"
+    echo "commit .rerere-cache/ on your personal branch so CI can replay it"
+    ;;
+  *)
+    echo "usage: bin/rerere-cache {enable|import|export}" >&2
+    exit 1
+    ;;
+esac

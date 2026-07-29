@@ -1,0 +1,147 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: Upstream repository to merge from (owner/name)
+        required: true
+        default: Pedro-Revez-Silva/shelfarr
+      upstream_branch:
+        description: Upstream branch to merge from
+        required: true
+        default: main
+      target_branch:
+        description: Branch that tracks upstream
+        required: true
+        default: main
+      personal_branch:
+        description: Branch that receives the merged upstream changes
+        required: true
+        default: personal-changes
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "${UPSTREAM_BRANCH}"
+
+      - name: Merge upstream into target branch
+        env:
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          git checkout "${TARGET_BRANCH}"
+          git merge --no-edit "upstream/${UPSTREAM_BRANCH}" || {
+            git merge --abort || true
+            echo "::error::Merge conflict between upstream/${UPSTREAM_BRANCH} and ${TARGET_BRANCH}. Resolve it locally and push."
+            exit 1
+          }
+          git push origin "${TARGET_BRANCH}"
+
+      - name: Merge target branch into personal branch
+        id: merge_personal
+        env:
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PERSONAL_BRANCH: ${{ inputs.personal_branch }}
+        run: |
+          git checkout "${PERSONAL_BRANCH}"
+
+          # Replay conflict resolutions recorded locally and committed to the branch.
+          git config rerere.enabled true
+          git config rerere.autoUpdate true
+          if [ -f bin/rerere-cache ]; then
+            bash bin/rerere-cache import
+          else
+            echo "bin/rerere-cache not on ${PERSONAL_BRANCH}; merging without recorded resolutions"
+          fi
+
+          if git merge --no-edit "${TARGET_BRANCH}"; then
+            echo "status=clean" >> "$GITHUB_OUTPUT"
+          elif [ -z "$(git ls-files --unmerged)" ]; then
+            # rerere resolved and staged every conflicted path; commit the merge.
+            git commit --no-edit
+            echo "status=rerere" >> "$GITHUB_OUTPUT"
+          else
+            {
+              echo "unresolved<<UNRESOLVED_EOF"
+              git diff --name-only --diff-filter=U
+              echo "UNRESOLVED_EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+            echo "::warning::Conflicts remain after rerere; opening a pull request instead."
+          fi
+
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/${PERSONAL_BRANCH}")" ]; then
+            git push origin "${PERSONAL_BRANCH}"
+          fi
+
+      - name: Open pull request for unresolved conflicts
+        id: conflict_pr
+        if: steps.merge_personal.outputs.status == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PERSONAL_BRANCH: ${{ inputs.personal_branch }}
+          UNRESOLVED: ${{ steps.merge_personal.outputs.unresolved }}
+        run: .github/scripts/sync-conflict-pr.sh
+
+      - name: Summary
+        if: always()
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          PERSONAL_BRANCH: ${{ inputs.personal_branch }}
+          STATUS: ${{ steps.merge_personal.outputs.status }}
+          PR_URL: ${{ steps.conflict_pr.outputs.url }}
+        continue-on-error: true
+        run: |
+          {
+            echo "### Sync Upstream"
+            echo ""
+            echo "Source: \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`"
+            echo ""
+            case "${STATUS}" in
+              clean)
+                echo "Merged \`${TARGET_BRANCH}\` into \`${PERSONAL_BRANCH}\` with no conflicts."
+                ;;
+              rerere)
+                echo "Conflicts were resolved automatically from the recorded rerere cache."
+                echo ""
+                echo "**Check CI on \`${PERSONAL_BRANCH}\`** — a replayed resolution can be clean but wrong."
+                ;;
+              conflict)
+                echo "Conflicts need manual resolution: ${PR_URL}"
+                ;;
+              *)
+                echo "Sync did not reach the \`${PERSONAL_BRANCH}\` merge."
+                ;;
+            esac
+          } >> "$GITHUB_STEP_SUMMARY"
