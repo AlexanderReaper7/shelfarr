@@ -10,26 +10,50 @@
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-git_dir="$(cd "$repo_root" && git rev-parse --git-dir && cd - >/dev/null)"
-case "$git_dir" in
-  /*) ;;
-  *) git_dir="${repo_root}/${git_dir}" ;;
-esac
+git_dir="$(git rev-parse --absolute-git-dir)"
 
 tracked="${repo_root}/.rerere-cache"
 live="${git_dir}/rr-cache"
 
-# Only preimage/postimage are the durable resolution; thisimage is scratch state
-# left behind by an in-progress merge.
+# Copy the recorded resolutions, keeping only variants that actually have a
+# postimage.
+#
+# Two details make this fiddly. Git numbers repeat variants (preimage.1,
+# postimage.1, ...), so fixed names would drop real resolutions. And a conflict
+# that was seen but abandoned -- which is what the workflow's PR fallback does
+# every time it aborts a merge -- leaves a preimage with no postimage. Such a
+# variant still matches the conflict on replay and shadows a later, resolved
+# variant, so it has to be dropped and the survivors renumbered from zero.
 copy_tree() {
-  local from="$1" to="$2" entry name
+  local from="$1" to="$2"
+  local entry name pre post suffix out
+
   for entry in "$from"/*/; do
     [ -d "$entry" ] || continue
     name="$(basename "$entry")"
-    mkdir -p "${to}/${name}"
-    for f in preimage postimage; do
-      [ -f "${entry}${f}" ] && cp "${entry}${f}" "${to}/${name}/${f}"
+    out=0
+
+    for pre in "${entry}preimage" "${entry}preimage".*; do
+      [ -f "$pre" ] || continue
+      suffix="${pre#"${entry}preimage"}"
+      post="${entry}postimage${suffix}"
+      [ -f "$post" ] || continue
+
+      if [ "$out" -eq 0 ]; then
+        rm -rf "${to:?}/${name}"
+        mkdir -p "${to}/${name}"
+        cp "$pre" "${to}/${name}/preimage"
+        cp "$post" "${to}/${name}/postimage"
+      else
+        cp "$pre" "${to}/${name}/preimage.${out}"
+        cp "$post" "${to}/${name}/postimage.${out}"
+      fi
+      out=$((out + 1))
     done
+
+    if [ "$out" -eq 0 ]; then
+      echo "  skipping ${name}: recorded conflict with no resolution"
+    fi
   done
 }
 

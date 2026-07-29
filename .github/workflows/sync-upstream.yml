@@ -51,66 +51,36 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch upstream "${UPSTREAM_BRANCH}"
 
-      - name: Merge upstream into target branch
+      # main tracks upstream but carries fork commits of its own, so this merge
+      # can conflict just like the personal one.
+      - name: Merge upstream into mirror branch
+        id: merge_mirror
         env:
           UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git checkout "${TARGET_BRANCH}"
-          git merge --no-edit "upstream/${UPSTREAM_BRANCH}" || {
-            git merge --abort || true
-            echo "::error::Merge conflict between upstream/${UPSTREAM_BRANCH} and ${TARGET_BRANCH}. Resolve it locally and push."
-            exit 1
-          }
-          git push origin "${TARGET_BRANCH}"
+          .github/scripts/sync-merge.sh \
+            "upstream/${UPSTREAM_BRANCH}" \
+            "${TARGET_BRANCH}" \
+            "sync/upstream-${UPSTREAM_BRANCH}" \
+            mirror
 
-      - name: Merge target branch into personal branch
+      # Runs even if the merge above needed a PR, so the personal branch still
+      # picks up whatever main already has.
+      - name: Merge mirror branch into personal branch
+        if: ${{ !cancelled() }}
         id: merge_personal
         env:
           TARGET_BRANCH: ${{ inputs.target_branch }}
           PERSONAL_BRANCH: ${{ inputs.personal_branch }}
-        run: |
-          git checkout "${PERSONAL_BRANCH}"
-
-          # Replay conflict resolutions recorded locally and committed to the branch.
-          git config rerere.enabled true
-          git config rerere.autoUpdate true
-          if [ -f bin/rerere-cache ]; then
-            bash bin/rerere-cache import
-          else
-            echo "bin/rerere-cache not on ${PERSONAL_BRANCH}; merging without recorded resolutions"
-          fi
-
-          if git merge --no-edit "${TARGET_BRANCH}"; then
-            echo "status=clean" >> "$GITHUB_OUTPUT"
-          elif [ -z "$(git ls-files --unmerged)" ]; then
-            # rerere resolved and staged every conflicted path; commit the merge.
-            git commit --no-edit
-            echo "status=rerere" >> "$GITHUB_OUTPUT"
-          else
-            {
-              echo "unresolved<<UNRESOLVED_EOF"
-              git diff --name-only --diff-filter=U
-              echo "UNRESOLVED_EOF"
-            } >> "$GITHUB_OUTPUT"
-            git merge --abort
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
-            echo "::warning::Conflicts remain after rerere; opening a pull request instead."
-          fi
-
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/${PERSONAL_BRANCH}")" ]; then
-            git push origin "${PERSONAL_BRANCH}"
-          fi
-
-      - name: Open pull request for unresolved conflicts
-        id: conflict_pr
-        if: steps.merge_personal.outputs.status == 'conflict'
-        env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_BRANCH: ${{ inputs.target_branch }}
-          PERSONAL_BRANCH: ${{ inputs.personal_branch }}
-          UNRESOLVED: ${{ steps.merge_personal.outputs.unresolved }}
-        run: .github/scripts/sync-conflict-pr.sh
+        run: |
+          .github/scripts/sync-merge.sh \
+            "${TARGET_BRANCH}" \
+            "${PERSONAL_BRANCH}" \
+            "${TARGET_BRANCH}" \
+            personal
 
       - name: Summary
         if: always()
@@ -119,29 +89,8 @@ jobs:
           UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
           TARGET_BRANCH: ${{ inputs.target_branch }}
           PERSONAL_BRANCH: ${{ inputs.personal_branch }}
-          STATUS: ${{ steps.merge_personal.outputs.status }}
-          PR_URL: ${{ steps.conflict_pr.outputs.url }}
-        continue-on-error: true
-        run: |
-          {
-            echo "### Sync Upstream"
-            echo ""
-            echo "Source: \`${UPSTREAM_REPO}@${UPSTREAM_BRANCH}\`"
-            echo ""
-            case "${STATUS}" in
-              clean)
-                echo "Merged \`${TARGET_BRANCH}\` into \`${PERSONAL_BRANCH}\` with no conflicts."
-                ;;
-              rerere)
-                echo "Conflicts were resolved automatically from the recorded rerere cache."
-                echo ""
-                echo "**Check CI on \`${PERSONAL_BRANCH}\`** — a replayed resolution can be clean but wrong."
-                ;;
-              conflict)
-                echo "Conflicts need manual resolution: ${PR_URL}"
-                ;;
-              *)
-                echo "Sync did not reach the \`${PERSONAL_BRANCH}\` merge."
-                ;;
-            esac
-          } >> "$GITHUB_STEP_SUMMARY"
+          MIRROR_STATUS: ${{ steps.merge_mirror.outputs.mirror_status }}
+          MIRROR_PR: ${{ steps.merge_mirror.outputs.mirror_pr_url }}
+          PERSONAL_STATUS: ${{ steps.merge_personal.outputs.personal_status }}
+          PERSONAL_PR: ${{ steps.merge_personal.outputs.personal_pr_url }}
+        run: .github/scripts/sync-summary.sh
