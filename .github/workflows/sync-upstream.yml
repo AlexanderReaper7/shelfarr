@@ -51,11 +51,15 @@ jobs:
           UPSTREAM_REPO: ${{ inputs.upstream_repo }}
           UPSTREAM_BRANCH: ${{ inputs.upstream_branch }}
         run: |
-          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
-          # Make the read-only intent structural: any push to upstream fails on
-          # the URL rather than relying on nothing ever attempting one.
-          git remote set-url --push upstream DISABLED
-          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          # Fetched by URL on purpose: no remote is created, so origin stays the
+          # only one. That keeps the read-only intent structural -- there is no
+          # upstream remote to push to even by mistake -- and it keeps gh
+          # pointed at this fork, since gh picks its base repository from the
+          # remotes and ranks one named "upstream" above "origin". With such a
+          # remote present the conflict fallback opens its pull request on the
+          # upstream repository instead of ours.
+          git fetch --no-tags "https://github.com/${UPSTREAM_REPO}.git" \
+            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
 
       # main tracks upstream but carries fork commits of its own, so this merge
       # can conflict just like the personal one.
