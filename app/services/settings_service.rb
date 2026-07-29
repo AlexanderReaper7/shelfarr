@@ -1,4 +1,35 @@
 class SettingsService
+  MANUAL_SAVE_SETTING_GROUPS = {
+    indexer: %w[
+      indexer_provider prowlarr_url prowlarr_api_key jackett_url jackett_api_key
+      newznab_url newznab_api_key prowlarr_tags jackett_indexer_filter
+    ],
+    library_platform: %w[
+      library_platform audiobookshelf_url audiobookshelf_api_key
+      bookorbit_url bookorbit_username bookorbit_password
+      grimmory_url grimmory_username grimmory_password
+      audiobookshelf_audiobook_library_id audiobookshelf_ebook_library_id
+      audiobookshelf_comicbook_library_id audiobookshelf_audiobook_scan_library_ids
+      audiobookshelf_ebook_scan_library_ids audiobookshelf_comicbook_scan_library_ids
+    ],
+    anna_archive: %w[anna_archive_enabled anna_archive_url anna_archive_api_key],
+    zlibrary: %w[zlibrary_enabled zlibrary_url zlibrary_email zlibrary_password],
+    hardcover: %w[hardcover_enabled hardcover_api_token],
+    google_books: %w[google_books_enabled google_books_api_key],
+    comic_vine: %w[comic_vine_enabled comic_vine_api_key],
+    discord: %w[discord_enabled discord_webhook_url],
+    oidc: %w[
+      oidc_enabled oidc_auto_redirect oidc_provider_name oidc_issuer oidc_client_id
+      oidc_client_secret oidc_scopes oidc_link_existing_users oidc_auto_create_users
+      oidc_default_role
+    ],
+    webhook: %w[webhook_enabled webhook_url webhook_token],
+    telegram: %w[
+      telegram_enabled telegram_update_mode telegram_bot_token telegram_bot_username
+      telegram_webhook_secret telegram_request_username
+    ]
+  }.freeze
+  MANUAL_SAVE_SETTING_KEYS = MANUAL_SAVE_SETTING_GROUPS.values.flatten.uniq.freeze
   DEFAULT_ANNA_ARCHIVE_URL = "https://annas-archive.gl"
   DEFAULT_ZLIBRARY_URLS = "https://z-library.sk\nhttps://z-library.bz\nhttps://z-library.rs"
   ENV_OVERRIDE_PREFIX = "SHELFARR_SETTING_"
@@ -168,10 +199,10 @@ class SettingsService
     allow_user_uploads: { type: "boolean", default: false, category: "security", description: "Allow non-admin users to upload book files directly" },
 
     # Anna's Archive
-    anna_archive_enabled: { type: "boolean", default: false, category: "anna_archive", description: "Enable Anna's Archive as an additional search source for ebooks" },
-    anna_archive_url: { type: "string", default: DEFAULT_ANNA_ARCHIVE_URL, category: "anna_archive", description: "Anna's Archive base URLs to try. Shelfarr uses the first compatible URL." },
+    anna_archive_enabled: { type: "boolean", default: false, category: "anna_archive", description: "Enable Anna's Archive as an additional search source for ebooks and audiobooks" },
+    anna_archive_url: { type: "string", default: DEFAULT_ANNA_ARCHIVE_URL, category: "anna_archive", description: "Anna's Archive HTTPS base URLs to try. Shelfarr uses the first compatible public URL." },
     anna_archive_api_key: { type: "string", default: "", category: "anna_archive", description: "Member API key from Anna's Archive (requires donation)" },
-    flaresolverr_url: { type: "string", default: "", category: "anna_archive", description: "FlareSolverr URL for bypassing DDoS protection (e.g., http://flaresolverr:8191)" },
+    flaresolverr_url: { type: "string", default: "", category: "anna_archive", description: "FlareSolverr URL for bypassing DDoS protection (e.g., http://flaresolverr:8191). Isolate FlareSolverr from private and metadata networks." },
 
     # Z-Library
     zlibrary_enabled: { type: "boolean", default: false, category: "zlibrary", description: "Enable Z-Library as an additional ebook search and direct download source. This unofficial integration may break if the service changes." },
@@ -322,6 +353,10 @@ class SettingsService
     def secret_setting_key?(key)
       key = key.to_s
       key == "discord_webhook_url" || key.include?("password") || key.include?("api_key") || key.include?("token") || key.include?("secret")
+    end
+
+    def manual_save_setting_key?(key)
+      secret_setting_key?(key) || MANUAL_SAVE_SETTING_KEYS.include?(key.to_s)
     end
 
     # Primary getter with default fallback

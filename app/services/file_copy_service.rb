@@ -17,15 +17,24 @@ class FileCopyService
   BUFFER_SIZE = 1024 * 1024 # 1 MB
   LIBRARY_FILE_MODE = 0o640
   DIRECTORY_MODE = 0o750
+  # Windows ACL-backed mounts can ignore chmod and synthesize broad Unix mode
+  # bits. Ordinary media and descriptor-pinned recovery artifacts remain usable
+  # when the process retains owner control and no special bits are present;
+  # application-private state still requires exact modes.
+  LIBRARY_FILE_MODES = (0o600..0o777).select { |mode| (mode & 0o600) == 0o600 }.freeze
+  LIBRARY_DIRECTORY_MODES = (0o700..0o777).freeze
+  HARDLINK_FALLBACK_FILE_MODES = [ 0o600, LIBRARY_FILE_MODE ].freeze
   COPY_LOCK_LEGACY_MAGIC = "shelfarr-copy-v1"
   COPY_LOCK_MAGIC = "shelfarr-copy-v2"
   COPY_LOCK_PATTERN = /\A\.shelfarr-copy-([0-9a-f]{32})\.lock\z/
   COPY_LOCK_LEGACY_PATTERN = /\A#{Regexp.escape(COPY_LOCK_LEGACY_MAGIC)}:([0-9a-f]{32})\z/
   COPY_LOCK_PENDING_PATTERN = /\A#{Regexp.escape(COPY_LOCK_MAGIC)}:([0-9a-f]{32}):pending\z/
   COPY_LOCK_RECORD_PATTERN = /\A#{Regexp.escape(COPY_LOCK_MAGIC)}:([0-9a-f]{32}):full:([0-9]+):([0-9]+)\z/
+  OWNER_PROBE_PATTERN = /\A\.shelfarr-owner-probe-[0-9a-f]{32}\.tmp\z/
   COPY_LOCK_COMPATIBILITY_PREPARED_PATTERN = /\A#{Regexp.escape(COPY_LOCK_MAGIC)}:([0-9a-f]{32}):compatibility:prepared:([0-9]+):([0-9]+):([0-9a-f]+)\z/
   COPY_LOCK_COMPATIBILITY_PATTERN = /\A#{Regexp.escape(COPY_LOCK_MAGIC)}:([0-9a-f]{32}):compatibility:(copying|complete):([0-9]+):([0-9]+):([0-9]+):([0-9]+):([0-9a-f]+)\z/
   COPY_QUARANTINE_PATTERN = /\A\.shelfarr-copy-quarantine-([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]{32})\z/
+  SOURCE_QUARANTINE_PATTERN = /\A\.shelfarr-source-quarantine-([0-9a-f]+)-([0-9a-f]+)-([0-9a-f]{32})\z/
   COPY_QUARANTINE_ENTRY = "entry"
   COPY_QUARANTINE_STALE_AGE = 24 * 60 * 60
   LINUX_RENAME_NOREPLACE = 0x1
@@ -33,8 +42,19 @@ class FileCopyService
   AT_REMOVEDIR = RUBY_PLATFORM.include?("darwin") ? 0x80 : 0x200
 
   class UnsafePathError < StandardError; end
+  class UnsafeFilePermissionsError < UnsafePathError; end
   class AtomicPublicationUnsupportedError < StandardError; end
+  class DurabilityUnsupportedError < StandardError; end
   class HardlinkUnsupportedError < StandardError; end
+  SourceFileSnapshot = Struct.new(
+    :path,
+    :parent_path,
+    :canonical_parent_path,
+    :parent_device,
+    :parent_inode,
+    :manifest,
+    keyword_init: true
+  )
   SourceRoot = Struct.new(
     :path,
     :canonical_path,
@@ -82,19 +102,44 @@ class FileCopyService
       dest,
       root: nil,
       source_root: nil,
+      source_snapshot: nil,
       heartbeat: nil,
       hardlink_mode: false,
-      allow_compatibility_fallback: false
+      allow_compatibility_fallback: false,
+      require_durable: false
     )
-      source_opener = hardlink_mode ? :with_pinned_hardlink_source : :with_pinned_source
-      send(source_opener, src, source_root: source_root) do |source, *_source_path|
-        publish_source_io_noreplace(
-          source,
-          dest,
-          root: root,
-          heartbeat: heartbeat,
-          allow_compatibility_fallback: allow_compatibility_fallback
-        )
+      if hardlink_mode
+        with_pinned_hardlink_source(src, source_root: source_root) do |source, parent, basename, parent_path, manifest|
+          validator = -> { validate_hardlink_source!(source, parent, basename, parent_path, manifest) }
+          publish_source_io_noreplace(
+            source,
+            dest,
+            root: root,
+            heartbeat: heartbeat,
+            allow_compatibility_fallback: allow_compatibility_fallback,
+            source_validator: validator,
+            accepted_modes: LIBRARY_FILE_MODES,
+            require_durable: require_durable
+          )
+        end
+      else
+        source_operation = if source_snapshot
+          ->(&operation) { with_pinned_source_snapshot(source_snapshot, &operation) }
+        else
+          ->(&operation) { with_pinned_source(src, source_root: source_root, &operation) }
+        end
+        source_operation.call do |source, _parent, _basename, _parent_path, validator|
+          publish_source_io_noreplace(
+            source,
+            dest,
+            root: root,
+            heartbeat: heartbeat,
+            allow_compatibility_fallback: allow_compatibility_fallback,
+            source_validator: validator,
+            accepted_modes: LIBRARY_FILE_MODES,
+            require_durable: require_durable
+          )
+        end
       end
       dest
     end
@@ -103,7 +148,7 @@ class FileCopyService
     # source race. The source name is first linked to a private destination
     # entry, which must match the already-open source descriptor before the
     # existing no-replace publication protocol can make it final.
-    def hardlink_noreplace(src, dest, root:, source_root:)
+    def hardlink_noreplace(src, dest, root:, source_root:, require_durable: false)
       with_pinned_hardlink_source(src, source_root: source_root) do |source, source_parent, source_basename, source_parent_path, source_manifest|
         publish_hardlink_noreplace(
           source,
@@ -112,7 +157,8 @@ class FileCopyService
           source_parent_path,
           source_manifest,
           dest,
-          root: root
+          root: root,
+          require_durable: require_durable
         )
       end
       dest
@@ -138,23 +184,29 @@ class FileCopyService
       heartbeat: nil,
       allow_compatibility_fallback: false
     )
-      with_pinned_source(src, source_root: source_root) do |source, source_parent, source_basename, source_parent_path|
-        source_identity = file_identity(source.stat)
-        publish_source_io_noreplace(
-          source,
-          dest,
-          root: root,
-          heartbeat: heartbeat,
-          allow_compatibility_fallback: allow_compatibility_fallback
-        )
-        remove_pinned_source_after_publication!(
-          source,
-          source_parent,
-          source_basename,
-          source_parent_path,
-          source_identity
-        )
+      source_snapshot = snapshot_source_file(src, source_root: source_root)
+      cp_noreplace(
+        src,
+        dest,
+        root: root,
+        source_root: source_root,
+        source_snapshot: source_snapshot,
+        heartbeat: heartbeat,
+        allow_compatibility_fallback: allow_compatibility_fallback,
+        require_durable: true
+      )
+      destination_snapshot = verified_library_file_snapshot(
+        src,
+        dest,
+        root: root,
+        source_snapshot: source_snapshot,
+        require_durable: true
+      )
+      raise Errno::ESTALE, "destination changed after no-clobber move" unless destination_snapshot
+      unless remove_source_file(source_snapshot, destination_snapshot: destination_snapshot)
+        raise Errno::ESTALE, "source changed after no-clobber move"
       end
+
       dest
     end
 
@@ -240,7 +292,10 @@ class FileCopyService
     # Create a destination directory relative to a trusted output root while
     # rejecting symlinks and non-directories in every path component.
     def ensure_directory(path, root:, mode: DIRECTORY_MODE)
+      expanded_path = Pathname(path).expand_path
+      expanded_root = Pathname(root).expand_path
       with_pinned_directory(path, root: root, create: true, mode: mode) do |directory|
+        apply_directory_mode!(directory, mode) unless expanded_path == expanded_root
         sync_io(directory)
       end
       path
@@ -248,10 +303,10 @@ class FileCopyService
 
     def secure_private_directory!(path, root:)
       with_pinned_directory(path, root: root, create: true, mode: 0o700) do |directory|
-        unless directory.stat.uid == Process.euid
+        unless private_entry_owned_by_process?(directory.stat, directory)
           raise UnsafePathError, "private staging directory is owned by another user"
         end
-        native_fchmod(directory.fileno, 0o700)
+        apply_directory_mode!(directory, 0o700)
         sync_io(directory)
       end
       path
@@ -263,10 +318,10 @@ class FileCopyService
       end
 
       with_pinned_directory(parent_path, root: root, create: true, mode: 0o700) do |parent|
-        unless parent.stat.uid == Process.euid
+        unless private_entry_owned_by_process?(parent.stat, parent)
           raise UnsafePathError, "private staging parent is owned by another user"
         end
-        native_fchmod(parent.fileno, 0o700)
+        apply_directory_mode!(parent, 0o700)
 
         loop do
           basename = "#{prefix}#{SecureRandom.hex(16)}"
@@ -277,7 +332,7 @@ class FileCopyService
           end
           child = open_pinned_directory_child(parent, basename)
           begin
-            native_fchmod(child.fileno, 0o700)
+            apply_directory_mode!(child, 0o700)
             sync_io(child)
             sync_io(parent)
             stat = child.stat
@@ -309,7 +364,7 @@ class FileCopyService
       end
 
       with_pinned_directory(parent_path, root: root, create: false, mode: 0o700) do |parent|
-        unless parent.stat.uid == Process.euid
+        unless private_entry_owned_by_process?(parent.stat, parent)
           raise UnsafePathError, "private staging directory is owned by another user"
         end
 
@@ -379,7 +434,7 @@ class FileCopyService
         lock = File.for_fd(descriptor, "r+b", autoclose: true)
         begin
           stat = lock.stat
-          unless stat.file? && stat.uid == Process.euid
+          unless stat.file? && private_entry_owned_by_process?(stat, parent)
             raise UnsafePathError, "private lock is not an application-owned regular file"
           end
 
@@ -640,7 +695,7 @@ class FileCopyService
 
       with_pinned_directory(staging_path, root: root, create: false, mode: 0o700) do |staging|
         with_pinned_relative_directory(staging, relative, create: true, mode: 0o700) do |directory|
-          native_fchmod(directory.fileno, 0o700)
+          apply_directory_mode!(directory, 0o700)
           sync_io(directory)
           validate_current_directory_identity!(staging_path, staging)
           validate_current_directory_identity!(staging_path.join(relative), directory)
@@ -738,10 +793,23 @@ class FileCopyService
     # Compare regular files through pinned descriptors. This is used by retry
     # reconciliation so a path swap cannot trick an import into reusing an
     # unrelated library file.
-    def same_file_content?(source_path, destination_path, root: nil, source_root: nil, hardlink_mode: false)
-      source_opener = hardlink_mode ? :with_pinned_hardlink_source : :with_pinned_source
+    def same_file_content?(
+      source_path,
+      destination_path,
+      root: nil,
+      source_root: nil,
+      source_snapshot: nil,
+      hardlink_mode: false
+    )
       result = nil
-      send(source_opener, source_path, source_root: source_root) do |source, *_source_path|
+      source_operation = if hardlink_mode
+        ->(&operation) { with_pinned_hardlink_source(source_path, source_root: source_root, &operation) }
+      elsif source_snapshot
+        ->(&operation) { with_pinned_source_snapshot(source_snapshot, &operation) }
+      else
+        ->(&operation) { with_pinned_source(source_path, source_root: source_root, &operation) }
+      end
+      source_operation.call do |source, *_source_path|
         result = same_io_content?(source, destination_path, root: root)
       end
       result
@@ -788,7 +856,8 @@ class FileCopyService
           stat = file.stat
           expected_identity = file_identity(stat)
           expected_mode = stat.mode & 0o7777
-          result = expected_mode == LIBRARY_FILE_MODE
+          result = expected_mode.in?(HARDLINK_FALLBACK_FILE_MODES) ||
+            (expected_mode.in?(LIBRARY_FILE_MODES) && synthetic_library_file_mode?(parent, expected_mode))
         end
         with_pinned_regular_child(parent, basename) do |current|
           stat = current.stat
@@ -833,6 +902,44 @@ class FileCopyService
       end
     end
 
+    def snapshot_source_file(path, source_root: nil)
+      if source_root
+        snapshot = nil
+        with_pinned_source(path, source_root: source_root) do |source, parent, _basename, parent_path|
+          parent_stat = parent.stat
+          snapshot = SourceFileSnapshot.new(
+            path: Pathname(path).expand_path,
+            parent_path: parent_path,
+            canonical_parent_path: parent_path.realpath,
+            parent_device: parent_stat.dev,
+            parent_inode: parent_stat.ino,
+            manifest: file_manifest_entry(source.stat).freeze
+          ).freeze
+        end
+        return snapshot
+      end
+
+      expanded = Pathname(path).expand_path
+      parent_path = expanded.parent
+      canonical_parent = parent_path.realpath
+      with_pinned_absolute_directory(canonical_parent) do |parent|
+        validate_current_directory_identity!(parent_path, parent)
+        with_pinned_regular_child(parent, expanded.basename.to_s) do |source|
+          parent_stat = parent.stat
+          return SourceFileSnapshot.new(
+            path: expanded,
+            parent_path: parent_path,
+            canonical_parent_path: canonical_parent,
+            parent_device: parent_stat.dev,
+            parent_inode: parent_stat.ino,
+            manifest: file_manifest_entry(source.stat).freeze
+          ).freeze
+        end
+      end
+    rescue Errno::ELOOP, Errno::ENOTDIR => error
+      raise UnsafePathError, "source path contains a symbolic link or non-directory: #{error.message}"
+    end
+
     # Snapshot and validate a directory tree through no-follow descriptors.
     # Later source opens can use the returned token to reject root replacement
     # and symlink swaps in every relative component.
@@ -873,6 +980,56 @@ class FileCopyService
         "source tree contains a symbolic link or non-regular path: #{error.message}"
     rescue Errno::ENOENT, Errno::EACCES => error
       raise UnsafePathError, "source tree is not safely accessible: #{error.message}"
+    end
+
+    # Atomically quarantine a source file, verify the exact snapshotted entry,
+    # and only then remove it. A raced replacement is restored or retained.
+    def remove_source_file(source_snapshot, destination_snapshot: nil)
+      expanded = source_snapshot.path
+      destination_validator = if destination_snapshot
+        -> { file_snapshot_current?(destination_snapshot, require_durable: true) }
+      end
+
+      with_pinned_absolute_directory(source_snapshot.canonical_parent_path) do |parent|
+        unless file_identity(parent.stat) == [ source_snapshot.parent_device, source_snapshot.parent_inode ]
+          raise Errno::ESTALE, "source parent identity changed during cleanup"
+        end
+        validate_current_directory_identity!(source_snapshot.parent_path, parent)
+        result = remove_pinned_child_if_identity(
+          parent,
+          expanded.basename.to_s,
+          source_snapshot.manifest.first(2),
+          expected_manifest: source_snapshot.manifest,
+          before_remove: destination_validator,
+          quarantine_kind: :source
+        )
+        if result.in?([ :missing, :mismatch, :retained ])
+          quarantined_result = remove_quarantined_source_snapshot(
+            parent,
+            expanded.basename.to_s,
+            source_snapshot,
+            before_remove: destination_validator
+          )
+          result = quarantined_result unless quarantined_result == :missing
+        end
+        if result == :missing && destination_validator && !destination_validator.call
+          result = :mismatch
+        end
+        sync_io(parent)
+        result.in?([ :removed, :missing ])
+      end
+    rescue Errno::ENOENT, Errno::ESTALE
+      false
+    end
+
+    def source_file_quarantined?(source_snapshot)
+      with_pinned_absolute_directory(source_snapshot.canonical_parent_path) do |parent|
+        return false unless file_identity(parent.stat) == [ source_snapshot.parent_device, source_snapshot.parent_inode ]
+
+        quarantined_source_snapshot_present?(parent, source_snapshot)
+      end
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR, Errno::ESTALE, UnsafePathError
+      false
     end
 
     # Atomically quarantine the current directory entry, verify that it is the
@@ -931,16 +1088,192 @@ class FileCopyService
       false
     end
 
-    def secure_library_file!(path, root: nil)
+    def secure_library_file!(path, root: nil, require_durable: false)
       with_pinned_destination_parent(path, root: root) do |parent, basename, parent_path|
+        expected_identity = nil
+        expected_mode = nil
+        file_durable = false
         with_pinned_regular_child(parent, basename) do |file|
-          native_fchmod(file.fileno, LIBRARY_FILE_MODE)
-          sync_io(file)
+          expected_mode = apply_file_mode!(
+            file,
+            LIBRARY_FILE_MODE,
+            accepted_modes: LIBRARY_FILE_MODES
+          )
+          file_durable = sync_io(file)
+          expected_identity = file_identity(file.stat)
+        end
+        with_pinned_regular_child(parent, basename) do |current|
+          stat = current.stat
+          unless file_identity(stat) == expected_identity && (stat.mode & 0o7777) == expected_mode
+            raise Errno::ESTALE, "library file changed during permission validation"
+          end
         end
         validate_current_directory_identity!(parent_path, parent)
-        sync_io(parent)
+        parent_durable = sync_io(parent)
+        if require_durable && !(file_durable && parent_durable)
+          raise DurabilityUnsupportedError, "destination filesystem fsync is unsupported"
+        end
       end
       path
+    end
+
+    # Compare source and destination through pinned descriptors, enforce the
+    # destination mode where appropriate, and return the exact library entry
+    # that was verified. Destructive callers carry this snapshot into cleanup.
+    def verified_library_file_snapshot(
+      source_path,
+      destination_path,
+      root:,
+      source_root: nil,
+      source_snapshot: nil,
+      hardlink_mode: false,
+      require_durable: false
+    )
+      result = nil
+      source_operation = if hardlink_mode
+        lambda do |&operation|
+          with_pinned_hardlink_source(source_path, source_root: source_root) do |source, parent, basename, parent_path, manifest|
+            validator = -> { validate_hardlink_source!(source, parent, basename, parent_path, manifest) }
+            operation.call(source, validator)
+            validator.call
+          end
+        end
+      elsif source_snapshot
+        ->(&operation) { with_pinned_source_snapshot(source_snapshot) { |source, *| operation.call(source, nil) } }
+      else
+        ->(&operation) { with_pinned_source(source_path, source_root: source_root) { |source, *| operation.call(source, nil) } }
+      end
+
+      source_operation.call do |source, source_validator|
+        with_pinned_destination_parent(destination_path, root: root) do |parent, basename, parent_path|
+          file_durable = false
+          manifest = nil
+          with_pinned_regular_child(parent, basename) do |destination|
+            source_stat = source.stat
+            destination_stat = destination.stat
+            next unless source_stat.size == destination_stat.size
+            if hardlink_mode && file_identity(source_stat) != file_identity(destination_stat)
+              destination_mode = destination_stat.mode & 0o7777
+              retry_safe_mode = destination_mode.in?(HARDLINK_FALLBACK_FILE_MODES) ||
+                (destination_mode.in?(LIBRARY_FILE_MODES) &&
+                  synthetic_library_file_mode?(parent, destination_mode))
+              next unless retry_safe_mode
+            end
+
+            source.rewind
+            destination.rewind
+            next unless compare_io(source, destination)
+
+            unless hardlink_mode
+              apply_file_mode!(
+                destination,
+                LIBRARY_FILE_MODE,
+                accepted_modes: LIBRARY_FILE_MODES
+              )
+            end
+            file_durable = sync_io(destination)
+            manifest = file_manifest_entry(destination.stat).freeze
+          end
+          next unless manifest
+
+          source_validator&.call
+          with_pinned_regular_child(parent, basename) do |current|
+            raise Errno::ESTALE, "library file changed after content validation" unless file_manifest_entry(current.stat) == manifest
+          end
+          validate_current_directory_identity!(parent_path, parent)
+          parent_durable = sync_io(parent)
+          if require_durable && !(file_durable && parent_durable)
+            raise DurabilityUnsupportedError, "destination filesystem fsync is unsupported"
+          end
+
+          parent_stat = parent.stat
+          result = SourceFileSnapshot.new(
+            path: Pathname(destination_path).expand_path,
+            parent_path: Pathname(parent_path).expand_path,
+            canonical_parent_path: Pathname(parent_path).realpath,
+            parent_device: parent_stat.dev,
+            parent_inode: parent_stat.ino,
+            manifest: manifest
+          ).freeze
+        end
+      end
+      result
+    rescue Errno::ENOENT, Errno::ELOOP, Errno::ENOTDIR
+      nil
+    rescue UnsafePathError => error
+      raise if error.is_a?(UnsafeFilePermissionsError)
+
+      nil
+    end
+
+    def file_snapshot_current?(snapshot, require_durable: false)
+      with_pinned_absolute_directory(snapshot.canonical_parent_path) do |parent|
+        return false unless file_identity(parent.stat) == [ snapshot.parent_device, snapshot.parent_inode ]
+
+        validate_current_directory_identity!(snapshot.parent_path, parent)
+        durable = false
+        with_pinned_regular_child(parent, snapshot.path.basename.to_s) do |file|
+          return false unless file_manifest_entry(file.stat) == snapshot.manifest
+
+          durable = sync_io(file)
+        end
+        with_pinned_regular_child(parent, snapshot.path.basename.to_s) do |current|
+          return false unless file_manifest_entry(current.stat) == snapshot.manifest
+        end
+        parent_durable = sync_io(parent)
+        return false if require_durable && !(durable && parent_durable)
+
+        true
+      end
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, Errno::ENOTDIR, Errno::ESTALE, UnsafePathError
+      false
+    end
+
+    def serialize_file_snapshot(snapshot)
+      manifest = snapshot.manifest
+      {
+        "path" => snapshot.path.to_s,
+        "parent_path" => snapshot.parent_path.to_s,
+        "canonical_parent_path" => snapshot.canonical_parent_path.to_s,
+        "parent_device" => snapshot.parent_device,
+        "parent_inode" => snapshot.parent_inode,
+        "manifest" => {
+          "device" => manifest.fetch(0),
+          "inode" => manifest.fetch(1),
+          "size" => manifest.fetch(3),
+          "mtime_numerator" => manifest.fetch(4).numerator,
+          "mtime_denominator" => manifest.fetch(4).denominator,
+          "ctime_numerator" => manifest.fetch(5).numerator,
+          "ctime_denominator" => manifest.fetch(5).denominator,
+          "mode" => manifest.fetch(6)
+        }
+      }
+    end
+
+    def deserialize_file_snapshot(attributes)
+      manifest = attributes.fetch("manifest")
+      SourceFileSnapshot.new(
+        path: Pathname(attributes.fetch("path")).expand_path,
+        parent_path: Pathname(attributes.fetch("parent_path")).expand_path,
+        canonical_parent_path: Pathname(attributes.fetch("canonical_parent_path")).expand_path,
+        parent_device: Integer(attributes.fetch("parent_device")),
+        parent_inode: Integer(attributes.fetch("parent_inode")),
+        manifest: [
+          Integer(manifest.fetch("device")),
+          Integer(manifest.fetch("inode")),
+          :file,
+          Integer(manifest.fetch("size")),
+          Rational(
+            Integer(manifest.fetch("mtime_numerator")),
+            Integer(manifest.fetch("mtime_denominator"))
+          ),
+          Rational(
+            Integer(manifest.fetch("ctime_numerator")),
+            Integer(manifest.fetch("ctime_denominator"))
+          ),
+          Integer(manifest.fetch("mode"))
+        ].freeze
+      ).freeze
     end
 
     # Reclaim private copy files left by a hard process exit. A unique lock
@@ -959,6 +1292,8 @@ class FileCopyService
               entry,
               [ match[1].to_i(16), match[2].to_i(16) ]
             )
+          elsif OWNER_PROBE_PATTERN.match?(entry)
+            cleanup_interrupted_owner_probe(parent, entry)
           end
         end
         validate_current_directory_identity!(parent_path, parent)
@@ -1012,6 +1347,76 @@ class FileCopyService
 
     private
 
+    # root_squash changes the UID reported for root-created entries. Discover
+    # that mapping from an exclusive entry on the same filesystem.
+    def private_entry_owned_by_process?(stat, parent)
+      effective_uid = Process.euid
+      return true if stat.uid == effective_uid
+      return false unless effective_uid.zero?
+
+      probe_basename = ".shelfarr-owner-probe-#{SecureRandom.hex(16)}.tmp"
+      probe_identity = nil
+      probe_uid = nil
+      trusted = false
+      begin
+        with_created_regular_child(parent, probe_basename, 0o600) do |probe|
+          probe_stat = probe.stat
+          probe_identity = file_identity(probe_stat)
+          probe_uid = probe_stat.uid
+          trusted = probe_stat.dev == stat.dev && probe_uid == stat.uid
+        end
+      ensure
+        if probe_identity
+          cleanup = remove_pinned_child_if_identity(
+            parent,
+            probe_basename,
+            probe_identity,
+            expected_owner_uid: probe_uid
+          )
+          trusted = false unless cleanup.in?([ :removed, :missing ])
+          cleanup_interrupted_owner_probes(parent, probe_uid)
+        end
+      end
+      trusted
+    end
+
+    # Probe a newly created sibling rather than chmodding retained download
+    # data. A broad fallback mode is retry-safe only when this filesystem
+    # demonstrably ignores the requested library mode.
+    def synthetic_library_file_mode?(parent, expected_mode)
+      probe_basename = ".shelfarr-owner-probe-#{SecureRandom.hex(16)}.tmp"
+      probe_identity = nil
+      probe_uid = nil
+      synthetic = false
+      begin
+        with_created_regular_child(parent, probe_basename, 0o600) do |probe|
+          probe_stat = probe.stat
+          probe_identity = file_identity(probe_stat)
+          probe_uid = probe_stat.uid
+          effective_mode = apply_file_mode!(
+            probe,
+            LIBRARY_FILE_MODE,
+            accepted_modes: LIBRARY_FILE_MODES
+          )
+          synthetic = effective_mode == expected_mode && effective_mode != LIBRARY_FILE_MODE
+        end
+      ensure
+        if probe_identity
+          cleanup = remove_pinned_child_if_identity(
+            parent,
+            probe_basename,
+            probe_identity,
+            expected_owner_uid: probe_uid
+          )
+          synthetic = false unless cleanup.in?([ :removed, :missing ])
+          cleanup_interrupted_owner_probes(parent, probe_uid)
+        end
+      end
+      synthetic
+    rescue UnsafePathError, SystemCallError
+      false
+    end
+
     def safe_relative_path(path)
       relative = Pathname(path.to_s)
       if relative.absolute? || relative.each_filename.any? { |part| part.in?([ ".", ".." ]) }
@@ -1020,12 +1425,60 @@ class FileCopyService
       relative
     end
 
+    def apply_file_mode!(file, requested_mode, accepted_modes:)
+      mode_error = nil
+      begin
+        native_fchmod(file.fileno, requested_mode)
+      rescue Errno::EACCES, Errno::EPERM, Errno::EOPNOTSUPP, Errno::ENOTSUP, Errno::ENOSYS => error
+        mode_error = error
+      end
+
+      effective_mode = file.stat.mode & 0o7777
+      unless effective_mode.in?(accepted_modes)
+        raise UnsafeFilePermissionsError,
+          "library filesystem did not preserve safe file permissions",
+          cause: mode_error
+      end
+      if mode_error || effective_mode != requested_mode
+        Rails.logger.warn(
+          "[FileCopyService] Library filesystem retained safe effective permissions instead of the requested mode"
+        )
+      end
+      effective_mode
+    end
+
+    def apply_directory_mode!(directory, requested_mode, accepted_modes: nil)
+      accepted_modes ||= requested_mode == DIRECTORY_MODE ? LIBRARY_DIRECTORY_MODES : [ requested_mode ]
+      mode_error = nil
+      begin
+        native_fchmod(directory.fileno, requested_mode)
+      rescue Errno::EACCES, Errno::EPERM, Errno::EOPNOTSUPP, Errno::ENOTSUP, Errno::ENOSYS => error
+        mode_error = error
+      end
+
+      effective_mode = directory.stat.mode & 0o7777
+      unless effective_mode.in?(accepted_modes)
+        raise UnsafeFilePermissionsError,
+          "filesystem did not preserve safe directory permissions",
+          cause: mode_error
+      end
+      if mode_error || effective_mode != requested_mode
+        Rails.logger.warn(
+          "[FileCopyService] Filesystem retained safe effective directory permissions instead of the requested mode"
+        )
+      end
+      effective_mode
+    end
+
     def publish_source_io_noreplace(
       source,
       destination,
       root:,
       heartbeat: nil,
-      allow_compatibility_fallback: false
+      allow_compatibility_fallback: false,
+      source_validator: nil,
+      accepted_modes: LIBRARY_FILE_MODES,
+      require_durable: false
     )
       raise Errno::EINVAL, "source is not a regular file" unless source.stat.file?
 
@@ -1037,12 +1490,15 @@ class FileCopyService
         temporary_identity = nil
         lock_identity = nil
         published_identity = nil
+        published_mode = LIBRARY_FILE_MODE
+        published_file_durable = false
 
         begin
           with_created_regular_child(parent, lock_basename, 0o600) do |lock|
             lock_identity = file_identity(lock.stat)
             raise UnsafePathError, "copy lock could not be acquired" unless lock.flock(File::LOCK_EX)
 
+            apply_file_mode!(lock, 0o600, accepted_modes: LIBRARY_FILE_MODES)
             sync_io(parent)
             persist_copy_lock_pending!(lock, token)
 
@@ -1050,21 +1506,40 @@ class FileCopyService
               temporary_identity = file_identity(temporary.stat)
               persist_copy_lock_identity!(lock, token, temporary_identity)
               sync_io(parent)
+              apply_file_mode!(temporary, 0o600, accepted_modes: accepted_modes)
               if heartbeat
                 copy_source_io(source, temporary, heartbeat: heartbeat)
               else
                 copy_source_io(source, temporary)
               end
-              native_fchmod(temporary.fileno, LIBRARY_FILE_MODE)
-              flush_and_sync(temporary)
+              published_mode = apply_file_mode!(
+                temporary,
+                LIBRARY_FILE_MODE,
+                accepted_modes: accepted_modes
+              )
+              published_file_durable = flush_and_sync(temporary)
+              if require_durable && !published_file_durable
+                raise DurabilityUnsupportedError, "destination file fsync is unsupported"
+              end
+              source_validator&.call
 
               begin
-                publish_private_child_noreplace!(
-                  parent,
-                  temporary_basename,
-                  basename,
-                  temporary_identity
-                )
+                if published_mode == LIBRARY_FILE_MODE
+                  publish_private_child_noreplace!(
+                    parent,
+                    temporary_basename,
+                    basename,
+                    temporary_identity
+                  )
+                else
+                  publish_private_child_noreplace!(
+                    parent,
+                    temporary_basename,
+                    basename,
+                    temporary_identity,
+                    mode: published_mode
+                  )
+                end
                 published_identity = temporary_identity
               rescue AtomicPublicationUnsupportedError
                 raise unless allow_compatibility_fallback
@@ -1072,19 +1547,29 @@ class FileCopyService
                 Rails.logger.warn(
                   "[FileCopyService] Atomic publication unsupported; using exclusive-copy compatibility mode"
                 )
-                published_identity = publish_private_child_by_copy_noreplace!(
+                published_identity, published_mode, published_file_durable =
+                  publish_private_child_by_copy_noreplace!(
                   parent,
                   temporary_basename,
                   basename,
                   temporary_identity,
                   lock: lock,
                   token: token,
-                  heartbeat: heartbeat
-                )
+                  heartbeat: heartbeat,
+                  accepted_modes: accepted_modes
+                  )
               end
-              validate_published_child!(parent, basename, published_identity)
+              validate_published_child!(
+                parent,
+                basename,
+                published_identity,
+                expected_mode: published_mode
+              )
               validate_current_directory_identity!(parent_path, parent)
-              sync_io(parent)
+              parent_durable = sync_io(parent)
+              if require_durable && !(published_file_durable && parent_durable)
+                raise DurabilityUnsupportedError, "destination filesystem fsync is unsupported"
+              end
             end
           end
         rescue
@@ -1113,7 +1598,8 @@ class FileCopyService
       source_parent_path,
       source_manifest,
       destination,
-      root:
+      root:,
+      require_durable: false
     )
       source_identity = source_manifest.first(2)
       expected_stable_manifest = stable_hardlink_snapshot_entry(source_manifest)
@@ -1132,6 +1618,7 @@ class FileCopyService
             lock_identity = file_identity(lock.stat)
             raise UnsafePathError, "copy lock could not be acquired" unless lock.flock(File::LOCK_EX)
 
+            apply_file_mode!(lock, 0o600, accepted_modes: LIBRARY_FILE_MODES)
             sync_io(parent)
 
             validate_hardlink_source!(
@@ -1157,14 +1644,19 @@ class FileCopyService
                 cause: error
             end
 
+            file_durable = false
             with_pinned_regular_child(parent, temporary_basename) do |temporary|
               temporary_stat = temporary.stat
               unless file_identity(temporary_stat) == temporary_identity &&
                   stable_hardlink_manifest_entry(temporary_stat) == expected_stable_manifest
                 raise Errno::ESTALE, "private hardlink does not match the pinned source"
               end
+              file_durable = sync_io(temporary)
             end
-            sync_io(parent)
+            private_parent_durable = sync_io(parent)
+            if require_durable && !(file_durable && private_parent_durable)
+              raise DurabilityUnsupportedError, "destination filesystem fsync is unsupported"
+            end
 
             validate_hardlink_source!(
               source,
@@ -1197,7 +1689,10 @@ class FileCopyService
               source_manifest
             )
             validate_current_directory_identity!(parent_path, parent)
-            sync_io(parent)
+            parent_durable = sync_io(parent)
+            if require_durable && !(file_durable && parent_durable)
+              raise DurabilityUnsupportedError, "destination filesystem fsync is unsupported"
+            end
           end
         ensure
           temporary_cleanup = remove_pinned_child_if_identity(
@@ -1288,9 +1783,12 @@ class FileCopyService
       lock:,
       token:,
       heartbeat:,
+      accepted_modes:,
       mode: LIBRARY_FILE_MODE
     )
       destination_identity = nil
+      destination_mode = nil
+      destination_durable = false
       source_size = nil
 
       begin
@@ -1310,6 +1808,7 @@ class FileCopyService
           )
           with_created_regular_child(parent, destination_basename, 0o600) do |destination|
             destination_identity = file_identity(destination.stat)
+            apply_file_mode!(destination, 0o600, accepted_modes: accepted_modes)
             persist_copy_lock_compatibility!(
               lock,
               token,
@@ -1325,8 +1824,8 @@ class FileCopyService
             else
               copy_source_io(source, destination)
             end
-            native_fchmod(destination.fileno, mode)
-            flush_and_sync(destination)
+            destination_mode = apply_file_mode!(destination, mode, accepted_modes: accepted_modes)
+            destination_durable = flush_and_sync(destination)
             unless file_identity(source.stat) == temporary_identity &&
                 source.stat.size == source_size && destination.stat.size == source_size
               raise Errno::ESTALE, "file changed during compatibility publication"
@@ -1343,7 +1842,7 @@ class FileCopyService
           parent,
           destination_basename,
           destination_identity,
-          expected_mode: mode
+          expected_mode: destination_mode
         )
         sync_io(parent)
         persist_copy_lock_compatibility!(
@@ -1354,7 +1853,7 @@ class FileCopyService
           destination_basename,
           destination_identity
         )
-        destination_identity
+        [ destination_identity, destination_mode, destination_durable ]
       rescue
         remove_pinned_child_if_identity(parent, destination_basename, destination_identity)
         sync_io(parent)
@@ -1384,32 +1883,13 @@ class FileCopyService
       end
     end
 
-    def remove_pinned_source_after_publication!(source, parent, basename, parent_path, expected_identity)
-      unless file_identity(source.stat) == expected_identity
-        raise Errno::ESTALE, "source changed during no-clobber move"
-      end
-      validate_current_directory_identity!(parent_path, parent)
-
-      with_pinned_regular_child(parent, basename) do |current|
-        unless file_identity(current.stat) == expected_identity
-          raise Errno::ESTALE, "source changed during no-clobber move"
-        end
-      end
-
-      native_unlinkat(parent.fileno, basename)
-    rescue Errno::ENOENT
-      # A concurrent cleanup already removed the exact verified source. The
-      # destination remains a complete, fsynced publication.
-      nil
-    end
-
     def cleanup_interrupted_copy(parent, token)
       lock_basename = ".shelfarr-copy-#{token}.lock"
       temporary_basename = ".shelfarr-copy-#{token}.tmp"
 
-      with_pinned_regular_child(parent, lock_basename) do |lock|
+      with_pinned_regular_child(parent, lock_basename, writable: true) do |lock|
         return unless lock.flock(File::LOCK_EX | File::LOCK_NB)
-        return unless lock.stat.uid == Process.euid
+        return unless secure_copy_lock?(lock, parent)
 
         lock_identity = file_identity(lock.stat)
         lock.rewind
@@ -1481,11 +1961,44 @@ class FileCopyService
       nil
     end
 
+    def cleanup_interrupted_owner_probes(parent, expected_owner_uid)
+      pinned_directory_children(parent).each do |entry|
+        next unless OWNER_PROBE_PATTERN.match?(entry)
+
+        cleanup_interrupted_owner_probe(parent, entry, expected_owner_uid: expected_owner_uid)
+      end
+    rescue Errno::ENOENT, Errno::EACCES, IOError
+      nil
+    end
+
+    def cleanup_interrupted_owner_probe(parent, basename, expected_owner_uid: nil)
+      identity = nil
+      with_pinned_regular_child(parent, basename) do |probe|
+        stat = probe.stat
+        owner_trusted = if expected_owner_uid
+          stat.uid == expected_owner_uid
+        else
+          private_entry_owned_by_process?(stat, parent)
+        end
+        return unless owner_trusted
+
+        identity = file_identity(stat)
+      end
+      remove_pinned_child_if_identity(
+        parent,
+        basename,
+        identity,
+        expected_owner_uid: expected_owner_uid
+      )
+    rescue Errno::ENOENT, Errno::EACCES, Errno::ELOOP, IOError, UnsafePathError
+      nil
+    end
+
     def cleanup_interrupted_quarantine(parent, basename, expected_identity)
       quarantine = open_pinned_directory_child(parent, basename)
       begin
         stat = quarantine.stat
-        return unless stat.uid == Process.euid && (stat.mode & 0o777) == 0o700
+        return unless secure_cleanup_quarantine?(quarantine, parent)
 
         quarantine_identity = file_identity(stat)
         children = pinned_directory_children(quarantine)
@@ -1520,6 +2033,24 @@ class FileCopyService
       end
     rescue Errno::ENOENT, Errno::ELOOP, UnsafePathError
       nil
+    end
+
+    def secure_copy_lock?(lock, parent)
+      stat = lock.stat
+      return false unless private_entry_owned_by_process?(stat, parent)
+      return false unless (stat.mode & 0o7777).in?(LIBRARY_FILE_MODES)
+
+      apply_file_mode!(lock, 0o600, accepted_modes: LIBRARY_FILE_MODES)
+      true
+    end
+
+    def secure_cleanup_quarantine?(quarantine, parent)
+      stat = quarantine.stat
+      return false unless private_entry_owned_by_process?(stat, parent)
+      return false unless (stat.mode & 0o7777).in?(LIBRARY_DIRECTORY_MODES)
+
+      apply_directory_mode!(quarantine, 0o700, accepted_modes: LIBRARY_DIRECTORY_MODES)
+      true
     end
 
     def persist_copy_lock_pending!(lock, token)
@@ -1659,11 +2190,63 @@ class FileCopyService
       with_pinned_absolute_directory(canonical_parent) do |parent|
         validate_current_directory_identity!(expanded.parent, parent)
         with_pinned_regular_child(parent, expanded.basename.to_s) do |source|
-          yield source, parent, expanded.basename.to_s, expanded.parent
+          manifest = file_manifest_entry(source.stat)
+          validator = lambda do
+            validate_pinned_source_manifest!(
+              source,
+              parent,
+              expanded.basename.to_s,
+              expanded.parent,
+              manifest
+            )
+          end
+          result = yield source, parent, expanded.basename.to_s, expanded.parent, validator
+          validator.call
+          result
         end
       end
     rescue Errno::ELOOP, Errno::ENOTDIR => error
       raise UnsafePathError, "source path contains a symbolic link or non-directory: #{error.message}"
+    end
+
+    def with_pinned_source_snapshot(source_snapshot)
+      expanded = source_snapshot.path
+      with_pinned_absolute_directory(source_snapshot.canonical_parent_path) do |parent|
+        unless file_identity(parent.stat) == [ source_snapshot.parent_device, source_snapshot.parent_inode ]
+          raise Errno::ESTALE, "source parent identity changed after it was snapshotted"
+        end
+        validate_current_directory_identity!(source_snapshot.parent_path, parent)
+        with_pinned_regular_child(parent, expanded.basename.to_s) do |source|
+          validator = lambda do
+            validate_pinned_source_manifest!(
+              source,
+              parent,
+              expanded.basename.to_s,
+              source_snapshot.parent_path,
+              source_snapshot.manifest
+            )
+          end
+          validator.call
+          result = yield source, parent, expanded.basename.to_s, source_snapshot.parent_path, validator
+          validator.call
+          result
+        end
+      end
+    rescue Errno::ELOOP, Errno::ENOTDIR => error
+      raise UnsafePathError, "source path contains a symbolic link or non-directory: #{error.message}"
+    end
+
+    def validate_pinned_source_manifest!(source, parent, basename, parent_path, expected_manifest)
+      unless file_manifest_entry(source.stat) == expected_manifest
+        raise Errno::ESTALE, "source file changed while it was being imported"
+      end
+      validate_current_directory_identity!(parent_path, parent)
+      with_pinned_regular_child(parent, basename) do |current|
+        unless file_manifest_entry(current.stat) == expected_manifest
+          raise Errno::ESTALE, "source path changed while it was being imported"
+        end
+      end
+      true
     end
 
     def with_pinned_hardlink_source(path, source_root:)
@@ -1760,10 +2343,17 @@ class FileCopyService
             unless expected_source == file_manifest_entry(source.stat)
               raise Errno::ESTALE, "source file changed after it was snapshotted"
             end
-            result = yield source, parent, relative.basename.to_s, parent_path
-            unless expected_source == file_manifest_entry(source.stat)
-              raise Errno::ESTALE, "source file changed while it was being imported"
+            validator = lambda do
+              validate_pinned_source_manifest!(
+                source,
+                parent,
+                relative.basename.to_s,
+                parent_path,
+                expected_source
+              )
             end
+            result = yield source, parent, relative.basename.to_s, parent_path, validator
+            validator.call
             result
           end
         end
@@ -1835,9 +2425,9 @@ class FileCopyService
           stat = child.stat
           if stat.directory?
             secure_pinned_library_tree!(child, heartbeat: heartbeat)
-            native_fchmod(child.fileno, DIRECTORY_MODE)
+            apply_directory_mode!(child, DIRECTORY_MODE)
           elsif stat.file?
-            native_fchmod(child.fileno, LIBRARY_FILE_MODE)
+            apply_file_mode!(child, LIBRARY_FILE_MODE, accepted_modes: LIBRARY_FILE_MODES)
           else
             raise UnsafePathError, "source tree contains a symbolic link or non-regular path"
           end
@@ -1846,7 +2436,7 @@ class FileCopyService
           child.close unless child.closed?
         end
       end
-      native_fchmod(directory.fileno, DIRECTORY_MODE)
+      apply_directory_mode!(directory, DIRECTORY_MODE)
       sync_io(directory)
     end
 
@@ -2101,9 +2691,9 @@ class FileCopyService
             nil
           end
           child = open_pinned_directory_child(current, part)
-          native_fchmod(child.fileno, mode)
           sync_io(current)
         end
+        apply_directory_mode!(child, mode) if create
         handles << child
         current = child
       end
@@ -2127,14 +2717,15 @@ class FileCopyService
       directory
     end
 
-    def with_pinned_regular_child(parent, basename)
+    def with_pinned_regular_child(parent, basename, writable: false)
+      access_mode = writable ? File::RDWR : File::RDONLY
       descriptor = native_openat(
         parent.fileno,
         basename,
-        File::RDONLY | File::NOFOLLOW | File::NONBLOCK,
+        access_mode | File::NOFOLLOW | File::NONBLOCK,
         0
       )
-      file = File.for_fd(descriptor, "rb", autoclose: true)
+      file = File.for_fd(descriptor, writable ? "r+b" : "rb", autoclose: true)
       begin
         raise UnsafePathError, "path is not a regular file" unless file.stat.file?
 
@@ -2171,12 +2762,21 @@ class FileCopyService
       raise Errno::ESTALE, "destination directory changed during publication"
     end
 
-    def remove_pinned_child_if_identity(parent, basename, expected_identity)
+    def remove_pinned_child_if_identity(
+      parent,
+      basename,
+      expected_identity,
+      expected_manifest: nil,
+      before_remove: nil,
+      quarantine_kind: :copy,
+      expected_owner_uid: nil
+    )
       return :mismatch unless expected_identity
 
       begin
         with_pinned_regular_child(parent, basename) do |child|
           return :mismatch unless file_identity(child.stat) == expected_identity
+          return :mismatch if expected_manifest && file_manifest_entry(child.stat) != expected_manifest
         end
       rescue Errno::ENOENT
         return :missing
@@ -2186,7 +2786,9 @@ class FileCopyService
 
       quarantine, quarantine_basename, quarantine_identity = create_cleanup_quarantine(
         parent,
-        expected_identity
+        expected_identity,
+        kind: quarantine_kind,
+        expected_owner_uid: expected_owner_uid
       )
       moved = false
       begin
@@ -2203,17 +2805,25 @@ class FileCopyService
         quarantined_identity = nil
         result = begin
           removal_result = with_pinned_regular_child(quarantine, COPY_QUARANTINE_ENTRY) do |child|
-            quarantined_identity = file_identity(child.stat)
-            if quarantined_identity == expected_identity
-              native_unlinkat(quarantine.fileno, COPY_QUARANTINE_ENTRY)
-              :removed
+            stat = child.stat
+            quarantined_identity = file_identity(stat)
+            manifest_matches = !expected_manifest ||
+              stable_hardlink_manifest_entry(stat) == stable_hardlink_snapshot_entry(expected_manifest)
+            if quarantined_identity == expected_identity && manifest_matches
+              if before_remove && !before_remove.call
+                restore_quarantined_child!(quarantine, parent, basename)
+                :mismatch
+              else
+                native_unlinkat(quarantine.fileno, COPY_QUARANTINE_ENTRY)
+                :removed
+              end
             end
           end
           removal_result || :retained
         rescue Errno::ELOOP, Errno::ENOTDIR, UnsafePathError
           :retained
         end
-        if quarantined_identity && quarantined_identity != expected_identity
+        if quarantined_identity && result == :retained
           restore_quarantined_child!(quarantine, parent, basename)
           result = :mismatch
         end
@@ -2227,6 +2837,15 @@ class FileCopyService
         result
       rescue Errno::ENOENT
         moved ? :retained : :missing
+      rescue
+        restore_cleanup_entry_after_error!(quarantine, parent, basename, expected_identity) if moved
+        remove_empty_cleanup_quarantine!(
+          parent,
+          quarantine_basename,
+          quarantine,
+          quarantine_identity
+        ) if moved
+        raise
       ensure
         unless moved
           remove_empty_cleanup_quarantine!(
@@ -2254,9 +2873,10 @@ class FileCopyService
       :retained
     end
 
-    def create_cleanup_quarantine(parent, expected_identity)
+    def create_cleanup_quarantine(parent, expected_identity, kind: :copy, expected_owner_uid: nil)
+      prefix = kind == :source ? ".shelfarr-source-quarantine" : ".shelfarr-copy-quarantine"
       loop do
-        basename = ".shelfarr-copy-quarantine-#{expected_identity.first.to_s(16)}-" \
+        basename = "#{prefix}-#{expected_identity.first.to_s(16)}-" \
           "#{expected_identity.last.to_s(16)}-#{SecureRandom.hex(16)}"
         begin
           native_mkdirat(parent.fileno, basename, 0o700)
@@ -2267,15 +2887,30 @@ class FileCopyService
         quarantine = open_pinned_directory_child(parent, basename)
         begin
           stat = quarantine.stat
-          unless stat.uid == Process.euid
+          owner_trusted = if expected_owner_uid
+            stat.uid == expected_owner_uid
+          else
+            private_entry_owned_by_process?(stat, parent)
+          end
+          unless owner_trusted
             raise UnsafePathError, "cleanup quarantine is owned by another user"
           end
 
-          native_fchmod(quarantine.fileno, 0o700)
+          apply_directory_mode!(
+            quarantine,
+            0o700,
+            accepted_modes: LIBRARY_DIRECTORY_MODES
+          )
           sync_io(quarantine)
           sync_io(parent)
           return [ quarantine, basename, file_identity(stat) ]
         rescue
+          remove_empty_cleanup_quarantine!(
+            parent,
+            basename,
+            quarantine,
+            file_identity(quarantine.stat)
+          ) rescue nil
           quarantine.close unless quarantine.closed?
           raise
         end
@@ -2294,6 +2929,94 @@ class FileCopyService
       raise UnsafePathError, "mismatched cleanup entry was retained in quarantine"
     rescue Errno::EEXIST
       raise UnsafePathError, "mismatched cleanup entry was retained because its original path is occupied"
+    end
+
+    def restore_cleanup_entry_after_error!(quarantine, parent, basename, expected_identity)
+      with_pinned_regular_child(quarantine, COPY_QUARANTINE_ENTRY) do |entry|
+        return unless file_identity(entry.stat) == expected_identity
+
+        restore_quarantined_child!(quarantine, parent, basename)
+        sync_io(parent)
+      end
+    rescue Errno::ENOENT
+      nil
+    end
+
+    def remove_quarantined_source_snapshot(parent, original_basename, snapshot, before_remove: nil)
+      expected_identity = snapshot.manifest.first(2)
+      prefix = ".shelfarr-source-quarantine-#{expected_identity.first.to_s(16)}-" \
+        "#{expected_identity.last.to_s(16)}-"
+      candidates = pinned_directory_children(parent).select { |entry| entry.start_with?(prefix) }
+
+      candidates.each do |basename|
+        next unless SOURCE_QUARANTINE_PATTERN.match?(basename)
+
+        quarantine = open_pinned_directory_child(parent, basename)
+        begin
+          next unless secure_cleanup_quarantine?(quarantine, parent)
+          next unless pinned_directory_children(quarantine) == [ COPY_QUARANTINE_ENTRY ]
+
+          matches = false
+          with_pinned_regular_child(quarantine, COPY_QUARANTINE_ENTRY) do |entry|
+            matches = file_identity(entry.stat) == expected_identity &&
+              stable_hardlink_manifest_entry(entry.stat) == stable_hardlink_snapshot_entry(snapshot.manifest)
+          end
+          next unless matches
+
+          if before_remove && !before_remove.call
+            restore_quarantined_child!(quarantine, parent, original_basename)
+            remove_empty_cleanup_quarantine!(
+              parent,
+              basename,
+              quarantine,
+              file_identity(quarantine.stat)
+            )
+            return :mismatch
+          end
+
+          native_unlinkat(quarantine.fileno, COPY_QUARANTINE_ENTRY)
+          sync_io(quarantine)
+          remove_empty_cleanup_quarantine!(
+            parent,
+            basename,
+            quarantine,
+            file_identity(quarantine.stat)
+          )
+          return :removed
+        ensure
+          quarantine.close unless quarantine.closed?
+        end
+      rescue Errno::ENOENT, Errno::ELOOP, UnsafePathError
+        next
+      end
+
+      :missing
+    end
+
+    def quarantined_source_snapshot_present?(parent, snapshot)
+      expected_identity = snapshot.manifest.first(2)
+      prefix = ".shelfarr-source-quarantine-#{expected_identity.first.to_s(16)}-" \
+        "#{expected_identity.last.to_s(16)}-"
+      pinned_directory_children(parent).any? do |basename|
+        next false unless basename.start_with?(prefix) && SOURCE_QUARANTINE_PATTERN.match?(basename)
+
+        quarantine = open_pinned_directory_child(parent, basename)
+        begin
+          next false unless private_entry_owned_by_process?(quarantine.stat, parent)
+          next false unless pinned_directory_children(quarantine) == [ COPY_QUARANTINE_ENTRY ]
+
+          matches = false
+          with_pinned_regular_child(quarantine, COPY_QUARANTINE_ENTRY) do |entry|
+            matches = file_identity(entry.stat) == expected_identity &&
+              stable_hardlink_manifest_entry(entry.stat) == stable_hardlink_snapshot_entry(snapshot.manifest)
+          end
+          matches
+        ensure
+          quarantine.close unless quarantine.closed?
+        end
+      rescue Errno::ENOENT, Errno::ELOOP, UnsafePathError
+        false
+      end
     end
 
     def remove_empty_cleanup_quarantine!(parent, basename, quarantine, expected_identity)
@@ -2437,14 +3160,16 @@ class FileCopyService
     def flush_and_sync(io)
       io.flush
       io.fsync
+      true
     rescue Errno::EINVAL, Errno::EOPNOTSUPP
-      nil
+      false
     end
 
     def sync_io(io)
       io.fsync
+      true
     rescue Errno::EINVAL, Errno::EOPNOTSUPP
-      nil
+      false
     end
 
     def same_stat_identity?(left, right)
