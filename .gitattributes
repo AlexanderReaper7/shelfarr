@@ -4,6 +4,12 @@
 *.sh text eol=lf
 bin/rerere-cache text eol=lf
 
+# rerere keys a resolution by hashing the conflict text, so these images must
+# round-trip byte for byte. Any eol conversion changes the hash and the cache
+# silently stops matching -- which is what happens when they are recorded on a
+# Windows clone with core.autocrlf on and replayed in CI on Linux.
+.rerere-cache/** -text
+
 # Mark the database schema as having been generated.
 db/schema.rb linguist-generated
 
