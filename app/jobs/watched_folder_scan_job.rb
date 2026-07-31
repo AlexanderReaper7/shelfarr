@@ -87,10 +87,16 @@ class WatchedFolderScanJob < ApplicationJob
     def scan_job_pending?(excluding_active_job_id: nil)
       return false unless solid_queue_adapter?
 
-      scope = SolidQueue::Job.where(class_name: name, finished_at: nil)
+      # Solid Queue keeps a failed job row forever with finished_at still NULL,
+      # so counting it as pending would convince ensure_running! that the chain
+      # is alive and stop it ever enqueuing a replacement. Exclude those the way
+      # DownloadMonitorJob does.
+      scope = SolidQueue::Job
+        .where(class_name: name, finished_at: nil)
+        .where.missing(:failed_execution)
       scope = scope.where.not(active_job_id: excluding_active_job_id) if excluding_active_job_id.present?
       scope.exists?
-    rescue ActiveRecord::StatementInvalid, NameError
+    rescue ActiveRecord::ActiveRecordError, NameError
       false
     end
 

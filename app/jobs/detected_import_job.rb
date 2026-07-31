@@ -20,7 +20,8 @@ class DetectedImportJob < ApplicationJob
         book: book,
         owner: detected_import,
         provenance: :watched_folder,
-        source_identity: detected_import.source_identity
+        source_identity: detected_import.source_identity,
+        source_base: WatchedFolderScanService.import_root
       )
 
       detected_import.update!(

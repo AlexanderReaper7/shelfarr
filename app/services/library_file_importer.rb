@@ -35,6 +35,7 @@ class LibraryFileImporter
   def initialize(mode:)
     @mode = MODES.include?(mode.to_s) ? mode.to_s : "copy"
     @root = nil
+    @source_base = nil
     @source_root = nil
     @source_snapshot = nil
     @hardlinked = 0
@@ -51,13 +52,18 @@ class LibraryFileImporter
   # expected_source_identity - optional [device, inode] recorded when the source
   #                            was detected. Nil skips the check (filesystems
   #                            that report no usable inode).
-  def import(source:, book:, base_path:, expected_source_identity: nil)
+  # source_base - the root the source was found under (the watched folder). Only
+  #               recorded, never traversed here; undo needs it to return a moved
+  #               file through descriptors pinned to that root instead of
+  #               trusting the source's parent path.
+  def import(source:, book:, base_path:, expected_source_identity: nil, source_base: nil)
     source = File.expand_path(source.to_s)
     raise Errno::ENOENT, source unless File.exist?(source)
 
     stat = File.lstat(source)
     raise "Refusing to import symbolic link: #{source}" if stat.symlink?
 
+    @source_base = source_base.presence
     @root = Pathname(base_path).expand_path
     destination_dir = PathTemplateService.build_destination(book, base_path: @root.to_s)
 
@@ -88,6 +94,7 @@ class LibraryFileImporter
     {
       "mode" => @mode,
       "base_path" => @root.to_s,
+      "source_base" => @source_base,
       "files" => @published_files,
       "directories" => @created_directories
     }
@@ -216,6 +223,10 @@ class LibraryFileImporter
   def publish(source, destination, source_root:)
     original = destination
     counter = 1
+    # Read before publishing: a move unlinks the source, and undo needs the
+    # identity the source had to tell "this file is still where the scanner
+    # found it" apart from "something unrelated has taken over that path".
+    source_identity = path_identity(source)
 
     begin
       destination = unique_destination(original, counter)
@@ -225,7 +236,7 @@ class LibraryFileImporter
       retry
     end
 
-    record_published_file(source, destination)
+    record_published_file(source, destination, source_identity)
     destination
   end
 
@@ -280,16 +291,24 @@ class LibraryFileImporter
     source_root ? nil : @source_snapshot
   end
 
-  def record_published_file(source, destination)
-    stat = File.lstat(destination)
-    @published_files << {
+  def record_published_file(source, destination, source_identity)
+    entry = {
       "destination" => destination,
       "source" => source,
-      "device" => stat.dev,
-      "inode" => stat.ino
+      "source_device" => source_identity&.first,
+      "source_inode" => source_identity&.last
     }
+    stat = File.lstat(destination)
+    @published_files << entry.merge("device" => stat.dev, "inode" => stat.ino)
   rescue SystemCallError
-    @published_files << { "destination" => destination, "source" => source }
+    @published_files << entry
+  end
+
+  def path_identity(path)
+    stat = File.lstat(path)
+    [ stat.dev, stat.ino ]
+  rescue SystemCallError
+    nil
   end
 
   # Refuse to publish a source whose inode no longer matches the one recorded
