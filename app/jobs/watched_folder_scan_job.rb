@@ -14,6 +14,11 @@ class WatchedFolderScanJob < ApplicationJob
   DEFAULT_INTERVAL_SECONDS = 300
   MIN_INTERVAL_SECONDS = 30
   MAX_INTERVAL_SECONDS = 86_400
+  # How long the status cache is allowed to claim a scan is running. Matches the
+  # concurrency lease below: past it the claiming worker cannot still hold the
+  # key, so a status stuck on "running" is the residue of a worker that was
+  # killed mid-scan and must not keep disabling "Scan now" for the cache TTL.
+  RUNNING_STATUS_TTL = 1.hour
 
   queue_as :default
   limits_concurrency key: "watched_folder_scan", duration: 1.hour, on_conflict: :discard
@@ -29,7 +34,14 @@ class WatchedFolderScanJob < ApplicationJob
     # Empty until the first manual scan runs (or in an environment whose cache is
     # not shared across processes, e.g. development's memory store).
     def scan_status
-      Rails.cache.read(STATUS_CACHE_KEY) || {}
+      status = Rails.cache.read(STATUS_CACHE_KEY) || {}
+      return status unless stale_running?(status)
+
+      # Report the abandoned run as a failed scan rather than a live one, so the
+      # queue offers "Scan now" again instead of spinning until the cache
+      # expires. Left in the cache as-is: the next scan overwrites it, and a
+      # write here would race the worker that owns the key.
+      status.merge(state: "idle", completed_at: status[:started_at], failed: true)
     end
 
     def scanning_now?
@@ -89,6 +101,11 @@ class WatchedFolderScanJob < ApplicationJob
     end
 
     private
+
+    def stale_running?(status)
+      status[:state] == "running" &&
+        (status[:started_at].blank? || status[:started_at] < RUNNING_STATUS_TTL.ago)
+    end
 
     def write_status(attrs)
       Rails.cache.write(STATUS_CACHE_KEY, attrs, expires_in: 1.day)

@@ -104,6 +104,53 @@ class WatchedFolderScanServiceTest < ActiveSupport::TestCase
     end
   end
 
+  test "a new file that reuses a consumed inode is detected, not swallowed by the stale claim" do
+    MetadataService.stub(:search, []) do
+      WatchedFolderScanService.scan!
+      consumed = DetectedImport.find_by(book_type: "ebook")
+      # Stand in for a move import: the detection keeps the identity of a source
+      # that no longer exists, and the filesystem hands the pair to a new file.
+      File.delete(consumed.source_path)
+      replacement = File.join(File.realpath(@watched), "Brandon Sanderson - Warbreaker.epub")
+      File.write(replacement, "dummy epub")
+      stat = File.lstat(replacement)
+      consumed.update_columns(source_device: stat.dev, source_inode: stat.ino)
+
+      assert_difference "DetectedImport.count", 1 do
+        WatchedFolderScanService.scan!
+      end
+
+      consumed.reload
+      assert_nil consumed.source_inode, "the stale claim is released so the index is free"
+      assert DetectedImport.exists?(source_path: replacement)
+    end
+  end
+
+  test "a hardlinked second path to a live source stays known" do
+    MetadataService.stub(:search, []) do
+      WatchedFolderScanService.scan!
+      known = DetectedImport.find_by(book_type: "ebook")
+      File.link(known.source_path, File.join(@watched, "Mistborn (hardlink).epub"))
+
+      assert_no_difference "DetectedImport.count" do
+        WatchedFolderScanService.scan!
+      end
+      assert_equal known.source_inode, known.reload.source_inode
+    end
+  end
+
+  test "metadata_path_for points at the audio file inside an audiobook folder" do
+    release = File.join(@watched, "Brandon Sanderson - Elantris")
+
+    assert_equal File.join(release, "track01.mp3"), WatchedFolderScanService.metadata_path_for(release)
+  end
+
+  test "metadata_path_for returns a single file unchanged" do
+    ebook = File.join(@watched, "Brandon Sanderson - Mistborn.epub")
+
+    assert_equal ebook, WatchedFolderScanService.metadata_path_for(ebook)
+  end
+
   test "returns nil when scanning is disabled" do
     set_setting("library_import_enabled", "false", "boolean", "import")
     assert_nil WatchedFolderScanService.scan!

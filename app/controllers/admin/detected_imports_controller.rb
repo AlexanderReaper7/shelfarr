@@ -48,6 +48,12 @@ module Admin
         return
       end
 
+      unless reclaim_stuck_import!(@detected_import)
+        redirect_to admin_detected_imports_path,
+          alert: "This item is being imported right now. Try again once that attempt finishes."
+        return
+      end
+
       apply_selection!(@detected_import)
       DetectedImportJob.perform_later(@detected_import.id)
       redirect_to admin_detected_imports_path,
@@ -122,10 +128,17 @@ module Admin
 
     # Re-run identification against the source, refreshing the suggestion and
     # alternates (useful after adding a metadata provider or API key).
+    #
+    # Reads the source exactly the way the scanner did: embedded metadata comes
+    # from the release's own audio file (the detection itself is the containing
+    # folder for an audiobook), while the filename parse falls back to the
+    # release name. Re-matching on the folder alone would discard the embedded
+    # tags and could replace a good suggestion with a filename-only guess.
     def rematch
       identification = LibraryAcquisitionService.identify(
-        source_path: @detected_import.source_path,
-        book_type: @detected_import.book_type
+        source_path: WatchedFolderScanService.metadata_path_for(@detected_import.source_path),
+        book_type: @detected_import.book_type,
+        filename_hint: File.basename(@detected_import.source_path.to_s)
       )
       @detected_import.update!(
         parsed_title: identification.parsed_title,
@@ -160,6 +173,32 @@ module Admin
         candidate["work_id"].present? && incoming_work_ids.include?(candidate["work_id"])
       end
       incoming + retained
+    end
+
+    # A row wedged in "importing" is actionable only because its lease expired,
+    # and DetectedImportJob#claim recognises that by the row's age. Everything
+    # below — applying a selection, the job's own claim — touches updated_at,
+    # which would push the row back inside the lease window and make the claim
+    # fail silently. Retire the dead lease first: "failed" is claimable outright
+    # and keeps the record of the interrupted attempt visible in the queue.
+    #
+    # Returns false when the row could not be retired because a worker really is
+    # importing it, so the caller can say so instead of flashing "Import queued".
+    def reclaim_stuck_import!(detected_import)
+      return true unless detected_import.stuck_importing?
+
+      reclaimed = DetectedImport
+        .where(id: detected_import.id, status: "importing")
+        .where("updated_at < ?", DetectedImport::STUCK_IMPORTING_AFTER.ago)
+        .update_all(
+          status: "failed",
+          error_message: "The previous import was interrupted before it finished.",
+          updated_at: Time.current
+        )
+      return false unless reclaimed == 1
+
+      detected_import.reload
+      true
     end
 
     # Resolve the user's decision from the approve form into the detection's

@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_07_23_120000) do
+ActiveRecord::Schema[8.1].define(version: 2026_07_31_120000) do
   create_table "acquisition_providers", force: :cascade do |t|
     t.boolean "allow_private_network", default: false, null: false
     t.string "api_key"
@@ -114,6 +114,7 @@ ActiveRecord::Schema[8.1].define(version: 2026_07_23_120000) do
     t.integer "match_confidence"
     t.string "parsed_author"
     t.string "parsed_title"
+    t.json "publication_record"
     t.bigint "source_device"
     t.bigint "source_inode"
     t.string "source_path", null: false

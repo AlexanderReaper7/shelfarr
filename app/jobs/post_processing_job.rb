@@ -465,7 +465,10 @@ class PostProcessingJob < ApplicationJob
     dismissed = 0
     DetectedImport.actionable
       .where(
-        "source_path = :path OR source_path LIKE :nested OR source_path IN (:enclosing)",
+        # SQLite's LIKE has no default escape character, so the backslashes
+        # sanitize_sql_like inserts are only inert with an explicit ESCAPE —
+        # without it a download path containing "_" would match nothing.
+        "source_path = :path OR source_path LIKE :nested ESCAPE '\\' OR source_path IN (:enclosing)",
         path: source_path,
         nested: nested_pattern,
         enclosing: enclosing

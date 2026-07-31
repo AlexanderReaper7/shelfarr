@@ -57,6 +57,17 @@ class DetectedImport < ApplicationRecord
     status == "imported"
   end
 
+  # The (device, inode) pair recorded when this candidate was detected, or nil
+  # on filesystems that report no usable identity. The importer refuses to
+  # publish a source whose inode no longer matches, so a path swapped between
+  # detection and approval cannot substitute different bytes under an approved
+  # title.
+  def source_identity
+    return nil if source_device.blank? || source_inode.blank?
+
+    [ source_device, source_inode ]
+  end
+
   def display_title
     parsed_title.presence || File.basename(source_path.to_s)
   end

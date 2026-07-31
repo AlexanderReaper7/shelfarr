@@ -181,10 +181,11 @@ class FileCopyService
       dest,
       root: nil,
       source_root: nil,
+      source_snapshot: nil,
       heartbeat: nil,
       allow_compatibility_fallback: false
     )
-      source_snapshot = snapshot_source_file(src, source_root: source_root)
+      source_snapshot ||= snapshot_source_file(src, source_root: source_root)
       cp_noreplace(
         src,
         dest,
@@ -749,7 +750,22 @@ class FileCopyService
       end
     end
 
-    def remove_directory_child_if_identity(parent_path, child_name, root:, device:, inode:)
+    # Remove a directory child that still has the expected (device, inode).
+    #
+    # +expected_entries+ pins the tree the caller believes it is deleting, in the
+    # same shape snapshot_source_root produces. When given, remove_source_tree
+    # quarantines the directory and restores it untouched unless its contents
+    # match exactly, so a caller that only owns an empty directory can pass +{}+
+    # and never destroy entries someone else added. When omitted the current
+    # contents are snapshotted and removed wholesale (the historical behaviour).
+    def remove_directory_child_if_identity(
+      parent_path,
+      child_name,
+      root:,
+      device:,
+      inode:,
+      expected_entries: nil
+    )
       if child_name.include?(File::SEPARATOR) || child_name.in?([ ".", ".." ])
         raise UnsafePathError, "directory child name is unsafe"
       end
@@ -776,7 +792,7 @@ class FileCopyService
             canonical_parent_path: canonical_parent,
             parent_device: parent_stat.dev,
             parent_inode: parent_stat.ino,
-            entries: snapshot_pinned_regular_tree(child).freeze
+            entries: (expected_entries || snapshot_pinned_regular_tree(child)).freeze
           ).freeze
           validate_current_directory_identity!(parent_path, parent)
           validate_current_directory_identity!(snapshot.path, child)
