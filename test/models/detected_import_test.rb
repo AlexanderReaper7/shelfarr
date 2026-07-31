@@ -96,4 +96,73 @@ class DetectedImportTest < ActiveSupport::TestCase
     assert_includes ids, failed.id
     assert_equal 2, ids.size
   end
+
+  test "dismiss_for_imported_source! retires the folder detection above an imported file" do
+    root = Dir.mktmpdir("di-dismiss")
+    SettingsService.set(:library_import_path, root)
+    release = File.join(File.realpath(root), "Some Audiobook")
+    FileUtils.mkdir_p(release)
+
+    # The scanner records an audiobook release as its folder, so the detection
+    # sits above the track the importer actually took.
+    enclosing = DetectedImport.create!(source_path: release, status: "detected", book_type: "audiobook")
+    sibling = DetectedImport.create!(
+      source_path: File.join(File.realpath(root), "Other Audiobook"), status: "detected"
+    )
+    already_imported = DetectedImport.create!(source_path: release, status: "imported")
+
+    dismissed = DetectedImport.dismiss_for_imported_source!(File.join(release, "track01.mp3"))
+
+    assert_equal 1, dismissed
+    assert_equal "dismissed", enclosing.reload.status
+    assert_equal "detected", sibling.reload.status
+    assert_equal "imported", already_imported.reload.status,
+      "only actionable rows are retired — an imported row records where the file came from"
+  ensure
+    FileUtils.rm_rf(root) if root
+  end
+
+  test "dismiss_for_imported_source! retires the detections inside an imported folder" do
+    root = Dir.mktmpdir("di-dismiss-nested")
+    SettingsService.set(:library_import_path, root)
+    release = File.join(File.realpath(root), "Some Release")
+    FileUtils.mkdir_p(release)
+
+    itself = DetectedImport.create!(source_path: release, status: "detected", book_type: "audiobook")
+    nested = DetectedImport.create!(
+      source_path: File.join(release, "bonus.epub"), status: "failed", book_type: "ebook"
+    )
+
+    assert_equal 2, DetectedImport.dismiss_for_imported_source!(release)
+    assert_equal "dismissed", itself.reload.status
+    assert_equal "dismissed", nested.reload.status
+  ensure
+    FileUtils.rm_rf(root) if root
+  end
+
+  test "dismiss_for_imported_source! does nothing without a source path" do
+    detection = DetectedImport.create!(source_path: "/watched/book.epub", status: "detected")
+
+    assert_equal 0, DetectedImport.dismiss_for_imported_source!(nil)
+    assert_equal 0, DetectedImport.dismiss_for_imported_source!("")
+    assert_equal "detected", detection.reload.status
+  end
+
+  test "dismiss_for_imported_source! escapes LIKE wildcards in the imported path" do
+    root = Dir.mktmpdir("di-wildcard")
+    SettingsService.set(:library_import_path, root)
+    canonical = File.realpath(root)
+    # "_" matches any single character in LIKE, so an unescaped prefix would
+    # sweep up the sibling release as well.
+    release = File.join(canonical, "A_Book")
+    FileUtils.mkdir_p(release)
+    decoy = DetectedImport.create!(source_path: File.join(canonical, "AxBook", "x.epub"), status: "detected")
+    target = DetectedImport.create!(source_path: File.join(release, "x.epub"), status: "detected")
+
+    assert_equal 1, DetectedImport.dismiss_for_imported_source!(release)
+    assert_equal "dismissed", target.reload.status
+    assert_equal "detected", decoy.reload.status
+  ensure
+    FileUtils.rm_rf(root) if root
+  end
 end

@@ -10,10 +10,7 @@
     <% if @scan_status[:state] == "running" %>
       <button type="button" disabled aria-busy="true"
               class="inline-flex items-center gap-2 px-4 py-2 bg-blue-600/60 text-white/80 font-medium rounded-lg whitespace-nowrap cursor-not-allowed">
-        <svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
-        </svg>
+        <%= render "scan_spinner" %>
         Scanning…
       </button>
     <% else %>
@@ -25,10 +22,7 @@
   <div class="mb-8 min-h-5">
     <% if @scan_status[:state] == "running" %>
       <p class="flex items-center gap-2 text-sm text-blue-300">
-        <svg class="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
-        </svg>
+        <%= render "scan_spinner" %>
         Scanning your watched folder for new book files…
       </p>
     <% elsif @scan_status[:completed_at].present? %>
@@ -47,7 +41,9 @@
   <% unless SettingsService.get(:library_import_enabled, default: false) %>
     <div class="bg-yellow-900/30 border border-yellow-700 rounded-lg p-4 mb-6 text-yellow-200">
       Watched-folder import is disabled. Enable it and set a path in
-      <%= link_to "Settings", admin_settings_path(anchor: "import"), class: "underline hover:text-yellow-100" %>.
+      <%# The settings page has no per-category anchors — its panels are tabs keyed by
+          tab name, and the import settings live under Downloads. %>
+      <%= link_to "Settings", admin_settings_path(anchor: "downloads"), class: "underline hover:text-yellow-100" %>.
     </div>
   <% end %>
 
@@ -69,6 +65,11 @@
           </tr>
         </thead>
         <tbody class="divide-y divide-gray-800">
+          <% status_colors = {
+               "detected" => "bg-blue-500/20 text-blue-400",
+               "importing" => "bg-yellow-500/20 text-yellow-300",
+               "failed" => "bg-red-500/20 text-red-400"
+             } %>
           <% @pending.each do |item| %>
             <tr class="hover:bg-gray-800/50 transition align-top">
               <td class="px-6 py-4 text-sm text-white">
@@ -88,11 +89,6 @@
               </td>
               <td class="px-6 py-4 text-sm text-gray-400 whitespace-nowrap"><%= item.book_type&.titleize %></td>
               <td class="px-6 py-4 whitespace-nowrap">
-                <% status_colors = {
-                     "detected" => "bg-blue-500/20 text-blue-400",
-                     "importing" => "bg-yellow-500/20 text-yellow-300",
-                     "failed" => "bg-red-500/20 text-red-400"
-                   } %>
                 <span class="px-2 py-1 text-xs rounded <%= status_colors[item.status] || 'bg-gray-700 text-gray-300' %>">
                   <%= item.status.titleize %>
                 </span>
@@ -103,9 +99,9 @@
               <td class="px-6 py-4 whitespace-nowrap text-right text-sm">
                 <% if item.actionable? %>
                   <div class="flex items-center justify-end gap-2">
-                    <%# Submit the match this row displays. Without it the import falls
-                        back to the filename parse and invents a new book, ignoring the
-                        suggestion the admin is approving by clicking Import. %>
+                    <%# Submit the match this row displays. Without it the import falls back
+                        to the filename parse and invents a new book, ignoring the very
+                        suggestion the admin is approving. %>
                     <%= button_to "Import", import_admin_detected_import_path(item), method: :post,
                           params: { selection: item.default_selection },
                           class: "px-3 py-1 bg-green-600 hover:bg-green-500 text-white rounded transition cursor-pointer" %>
@@ -184,9 +180,11 @@
                 <div class="flex items-center justify-end gap-2">
                   <%= button_to "Restore", restore_admin_detected_import_path(item), method: :post,
                         class: "px-3 py-1 bg-blue-600 hover:bg-blue-500 text-white rounded transition cursor-pointer" %>
+                  <%# Removing the entry un-suppresses the file, so this is only for pruning
+                      entries whose source is gone — which the controller enforces. %>
                   <%= button_to "Remove", admin_detected_import_path(item), method: :delete,
                         class: "px-3 py-1 bg-gray-800 hover:bg-gray-700 text-gray-400 rounded transition cursor-pointer",
-                        form: { data: { turbo_confirm: "Remove this dismissed detection permanently?" } } %>
+                        form: { data: { turbo_confirm: "Remove this entry? Only possible once the file is gone from your watched folder — while it is there, this entry is what keeps it dismissed." } } %>
                 </div>
               </td>
             </tr>

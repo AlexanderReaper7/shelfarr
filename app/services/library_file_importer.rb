@@ -1,27 +1,25 @@
 # frozen_string_literal: true
 
 # Publishes a source file or directory into the organised library using the
-# configured import mode (copy / move / hardlink), reusing FileCopyService's
-# atomic, no-replace, TOCTOU-safe primitives — the same ones PostProcessingJob
-# uses for request downloads. Only the mode dispatch and traversal live here;
-# every actual filesystem publication goes through FileCopyService so the hard
-# safety guarantees are shared, not re-implemented.
+# configured import mode (copy / move / hardlink), on FileCopyService's atomic,
+# no-replace, TOCTOU-safe primitives — the same ones PostProcessingJob uses for
+# request downloads. Only mode dispatch and traversal live here; every actual
+# publication goes through FileCopyService, so the safety guarantees are shared
+# rather than re-implemented.
 #
-# Single files are renamed with the book's filename template. Directory imports
-# (multi-file audiobooks) preserve the source layout and filenames. The source
-# is never mutated except by an explicit "move", which FileCopyService performs
-# only after a durable publication.
+# Single files are renamed with the book's filename template; directory imports
+# (multi-file audiobooks) preserve the source layout. The source is never mutated
+# except by an explicit "move", performed only after a durable publication.
 #
-# Every import is anchored on one immutable source snapshot taken up front. The
-# caller may pass the (device, inode) pair recorded when the source was first
-# detected; publication is refused unless the pinned snapshot still has that
-# identity, so a source swapped between detection and approval cannot smuggle
-# different bytes in under an approved title.
+# Every import is anchored on one immutable snapshot taken up front. The caller
+# may pass the (device, inode) recorded at detection; publication is refused
+# unless the snapshot still has that identity, so a source swapped between
+# detection and approval cannot smuggle different bytes under an approved title.
 #
 # The result carries an exact record of what was published — every file created
-# and every directory this import brought into existence — so a failed
-# finalization or an admin undo can reverse precisely this import instead of
-# deleting a templated destination directory shared with other books.
+# and every directory brought into existence — so a failed finalization or an
+# admin undo reverses precisely this import instead of deleting a templated
+# directory shared with other books.
 class LibraryFileImporter
   MODES = %w[copy move hardlink].freeze
 
@@ -45,17 +43,15 @@ class LibraryFileImporter
     @created_directories = []
   end
 
-  # Import +source+ into the library for +book+, rooted at +base_path+ (the
-  # book type's output root). Returns a Result whose imported_path is the file
-  # (flat output / single file) or the per-book directory.
+  # Import +source+ into the library for +book+, rooted at +base_path+ (the book
+  # type's output root). imported_path is the file (flat output / single file) or
+  # the per-book directory.
   #
-  # expected_source_identity - optional [device, inode] recorded when the source
-  #                            was detected. Nil skips the check (filesystems
-  #                            that report no usable inode).
-  # source_base - the root the source was found under (the watched folder). Only
-  #               recorded, never traversed here; undo needs it to return a moved
-  #               file through descriptors pinned to that root instead of
-  #               trusting the source's parent path.
+  # expected_source_identity - optional [device, inode] from detection; nil skips
+  #                            the check (filesystems with no usable inode).
+  # source_base - the root the source was found under. Only recorded, never
+  #               traversed here; undo needs it to return a moved file through
+  #               descriptors pinned to that root.
   def import(source:, book:, base_path:, expected_source_identity: nil, source_base: nil)
     source = File.expand_path(source.to_s)
     raise Errno::ENOENT, source unless File.exist?(source)
@@ -86,10 +82,10 @@ class LibraryFileImporter
     )
   end
 
-  # The exact, replayable description of what this import put on disk. Ordered
-  # so a reversal can remove files first and then the directories it created,
-  # deepest last-created first. Readable after a failure too, so a caller can
-  # reverse a tree import that raised partway through.
+  # The exact, replayable description of what this import put on disk, ordered so
+  # a reversal removes files first, then the directories it created, deepest
+  # first. Readable after a failure too, so a caller can reverse a tree import
+  # that raised partway through.
   def publication_record
     {
       "mode" => @mode,
@@ -115,10 +111,10 @@ class LibraryFileImporter
     PathTemplateService.flat_output?(book) ? imported : destination_dir
   end
 
-  # A single-file hardlink resolves the source pathname again inside
-  # FileCopyService, so the approved inode is confirmed after the fact: a
-  # hardlink shares its target's inode, and the caller reverses the publication
-  # when this does not match. Tree hardlinks are already pinned to the snapshot.
+  # A single-file hardlink re-resolves the source pathname inside FileCopyService,
+  # so the approved inode is confirmed after the fact: a hardlink shares its
+  # target's inode, and the caller reverses the publication on a mismatch. Tree
+  # hardlinks are already pinned to the snapshot.
   def verify_hardlink_identity!(destination, expected_source_identity)
     return unless @mode == "hardlink" && @hardlinked.positive?
 
@@ -134,8 +130,8 @@ class LibraryFileImporter
 
   def import_directory(source, destination_dir, book, expected_source_identity)
     # A blank path template writes straight into the output root, which a
-    # multi-file release cannot survive: its tracks would be scattered loose
-    # among every other book and book.file_path would claim the root itself.
+    # multi-file release cannot survive: its tracks would scatter among every
+    # other book and book.file_path would claim the root itself.
     # UploadZipImportFileService refuses the same configuration.
     if PathTemplateService.flat_output?(book)
       raise FlatOutputUnsupportedError,
@@ -151,11 +147,10 @@ class LibraryFileImporter
     consume_source_tree! if @mode == "move"
   end
 
-  # A directory move publishes every file durably first and only then unlinks
-  # the source tree in one validated step. Removing each file as it was
-  # published would invalidate the immutable snapshot the remaining files are
-  # pinned against, failing the import partway through with the source already
-  # half-consumed.
+  # A directory move publishes every file durably first, then unlinks the source
+  # tree in one validated step. Removing each file as it was published would
+  # invalidate the snapshot the remaining files are pinned against, failing the
+  # import with the source already half-consumed.
   def consume_source_tree!
     unless FileCopyService.remove_source_tree(@source_root)
       raise Errno::ESTALE, "source tree changed during move import"
@@ -182,9 +177,9 @@ class LibraryFileImporter
   end
 
   # Create +path+ under the output root, remembering the components that did not
-  # exist beforehand. Only those are candidates for removal on undo, and even
-  # then only while still empty — a templated "Author/Book" directory is
-  # routinely shared with files this import does not own.
+  # exist beforehand. Only those may be removed on undo, and only while still
+  # empty — a templated "Author/Book" directory is routinely shared with files
+  # this import does not own.
   def ensure_recorded_directory(path)
     missing = missing_components(path)
     FileCopyService.ensure_directory(path, root: @root, mode: 0o750)
@@ -223,9 +218,9 @@ class LibraryFileImporter
   def publish(source, destination, source_root:)
     original = destination
     counter = 1
-    # Read before publishing: a move unlinks the source, and undo needs the
-    # identity the source had to tell "this file is still where the scanner
-    # found it" apart from "something unrelated has taken over that path".
+    # Read before publishing: a move unlinks the source, and undo needs its
+    # identity to tell "still where the scanner found it" from "something
+    # unrelated has taken over that path".
     source_identity = path_identity(source)
 
     begin
@@ -244,7 +239,7 @@ class LibraryFileImporter
     case @mode
     when "move"
       # A directory move defers source removal to consume_source_tree!, so the
-      # per-file step here is a durable copy against the pinned snapshot.
+      # per-file step is a durable copy against the pinned snapshot.
       if source_root
         FileCopyService.cp_noreplace(
           source, destination,
@@ -324,10 +319,10 @@ class LibraryFileImporter
       "Refusing to import #{source}: it is no longer the file that was detected and approved"
   end
 
-  # Enumerate a directory's children from the immutable source snapshot rather
-  # than a fresh readdir, so a mid-import path swap cannot introduce new entries.
-  # The snapshot is grouped by parent directory once (see children_by_parent) so
-  # a deep tree costs O(entries) total instead of O(entries) per directory.
+  # A directory's children from the immutable snapshot rather than a fresh
+  # readdir, so a mid-import path swap cannot introduce new entries. Grouped by
+  # parent once (see children_by_parent), so a deep tree costs O(entries) total
+  # instead of per directory.
   def manifest_children(directory)
     relative = Pathname(directory).expand_path.relative_path_from(@source_root.path)
     (children_by_parent[relative] || []).sort

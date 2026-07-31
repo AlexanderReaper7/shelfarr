@@ -6,18 +6,16 @@
 # overlapping scans, and each run re-arms the next at the configured interval.
 class WatchedFolderScanJob < ApplicationJob
   SCHEDULE_CACHE_KEY = "watched_folder_scan/next_run_at"
-  # Progress/result of the most recent manual scan, for the review-queue UI.
-  # Backed by the shared cache (solid_cache in production) and written only by
-  # the worker running the scan, so the web process rendering the queue sees a
-  # consistent state and never a stuck "running" flag from a crossed process.
+  # Progress/result of the latest scan, for the review-queue UI. Backed by the
+  # shared cache (solid_cache in production) and written only by the worker
+  # running the scan, so the web process never sees a crossed-process state.
   STATUS_CACHE_KEY = "watched_folder_scan/status"
   DEFAULT_INTERVAL_SECONDS = 300
   MIN_INTERVAL_SECONDS = 30
   MAX_INTERVAL_SECONDS = 86_400
-  # How long the status cache is allowed to claim a scan is running. Matches the
-  # concurrency lease below: past it the claiming worker cannot still hold the
-  # key, so a status stuck on "running" is the residue of a worker that was
-  # killed mid-scan and must not keep disabling "Scan now" for the cache TTL.
+  # How long the cache may claim a scan is running. Matches the concurrency lease
+  # below: past it the worker cannot still hold the key, so a stuck "running" is
+  # the residue of a killed worker and must not keep disabling "Scan now".
   RUNNING_STATUS_TTL = 1.hour
 
   queue_as :default
@@ -29,18 +27,16 @@ class WatchedFolderScanJob < ApplicationJob
         SettingsService.get(:library_import_path).to_s.strip.present?
     end
 
-    # Snapshot of the latest manual scan for the queue UI: state ("running" /
-    # "idle"), when it completed, and how many candidates/new detections it saw.
-    # Empty until the first manual scan runs (or in an environment whose cache is
-    # not shared across processes, e.g. development's memory store).
+    # Snapshot for the queue UI: state ("running" / "idle"), when it completed,
+    # and how many candidates/new detections it saw. Empty until the first scan
+    # runs, or where the cache is not shared across processes (development).
     def scan_status
       status = Rails.cache.read(STATUS_CACHE_KEY) || {}
       return status unless stale_running?(status)
 
-      # Report the abandoned run as a failed scan rather than a live one, so the
-      # queue offers "Scan now" again instead of spinning until the cache
-      # expires. Left in the cache as-is: the next scan overwrites it, and a
-      # write here would race the worker that owns the key.
+      # Report an abandoned run as failed, not live, so the queue offers "Scan
+      # now" again instead of spinning until the cache expires. Not written back:
+      # the next scan overwrites it, and writing here would race the key's owner.
       status.merge(state: "idle", completed_at: status[:started_at], failed: true)
     end
 
@@ -80,6 +76,16 @@ class WatchedFolderScanJob < ApplicationJob
       perform_later
     end
 
+    # Arm the next link of the chain unless one is already pending. The running
+    # job passes its own active_job_id so it does not count itself and leave the
+    # chain unarmed.
+    def schedule_next!(excluding_active_job_id: nil)
+      return if scan_job_pending?(excluding_active_job_id: excluding_active_job_id)
+
+      reserve_schedule!
+      set(wait: interval_seconds.seconds).perform_later
+    end
+
     def clear_schedule!
       Rails.cache.delete(SCHEDULE_CACHE_KEY)
     end
@@ -87,10 +93,10 @@ class WatchedFolderScanJob < ApplicationJob
     def scan_job_pending?(excluding_active_job_id: nil)
       return false unless solid_queue_adapter?
 
-      # Solid Queue keeps a failed job row forever with finished_at still NULL,
-      # so counting it as pending would convince ensure_running! that the chain
-      # is alive and stop it ever enqueuing a replacement. Exclude those the way
-      # DownloadMonitorJob does.
+      # Solid Queue keeps failed rows forever with finished_at still NULL, so
+      # counting them as pending would convince ensure_running! the chain is
+      # alive and stop it enqueuing a replacement. Excluded as DownloadMonitorJob
+      # does.
       scope = SolidQueue::Job
         .where(class_name: name, finished_at: nil)
         .where.missing(:failed_execution)
@@ -132,29 +138,32 @@ class WatchedFolderScanJob < ApplicationJob
     end
   end
 
-  # manual: true is passed by the "Scan now" button. Such a scan announces its
-  # progress to the review queue (a spinner while it runs, its result when it
-  # finishes) and refreshes the queue on completion so new detections appear
-  # without a manual reload. The recurring background scan stays silent — it only
-  # records its completion so "last scanned" stays fresh, and relies on the
-  # per-record broadcasts to surface anything it finds.
+  # manual: true comes from the "Scan now" button, and pushes progress to the
+  # review queue (a spinner, then the result) so detections appear without a
+  # reload. The background scan stays silent — per-record broadcasts surface what
+  # it finds — but records the same status, because that status is what tells the
+  # queue a scan is in flight. Recording it only for manual scans let the screen
+  # offer "Scan now" during a background scan, whose concurrency key then
+  # discarded the manual job after the admin was told it had started.
   def perform(manual: false)
     unless self.class.scanning_enabled?
       self.class.clear_schedule!
       return
     end
 
-    if manual
-      self.class.mark_running!
-      self.class.broadcast_queue_refresh
+    self.class.mark_running!
+    self.class.broadcast_queue_refresh if manual
+
+    # Only the scan is rescued, so the status and refresh are written on exactly
+    # one path; mark_completed!(nil) already reports the run as failed.
+    result = begin
+      WatchedFolderScanService.scan!
+    rescue => e
+      Rails.logger.error "[WatchedFolderScanJob] Scan failed (#{e.class}): #{e.message}"
+      nil
     end
 
-    result = WatchedFolderScanService.scan!
     self.class.mark_completed!(result)
-    self.class.broadcast_queue_refresh if manual
-  rescue => e
-    Rails.logger.error "[WatchedFolderScanJob] Scan failed (#{e.class}): #{e.message}"
-    self.class.mark_completed!(nil)
     self.class.broadcast_queue_refresh if manual
   ensure
     schedule_next_run if self.class.scanning_enabled?
@@ -163,9 +172,6 @@ class WatchedFolderScanJob < ApplicationJob
   private
 
   def schedule_next_run
-    return if self.class.scan_job_pending?(excluding_active_job_id: job_id)
-
-    self.class.send(:reserve_schedule!)
-    WatchedFolderScanJob.set(wait: self.class.interval_seconds.seconds).perform_later
+    self.class.schedule_next!(excluding_active_job_id: job_id)
   end
 end

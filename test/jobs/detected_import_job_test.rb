@@ -121,11 +121,32 @@ class DetectedImportJobTest < ActiveJob::TestCase
     assert_equal "imported", detection.reload.status
   end
 
+  test "each detection carries its own concurrency lease for the stuck window" do
+    first = DetectedImport.create!(source_path: "/x", status: "detected")
+    second = DetectedImport.create!(source_path: "/y", status: "detected")
+
+    # A slow import is still running when the row looks stuck and the admin
+    # recovers it; the lease makes the recovery attempt wait rather than reverse
+    # the publication the original is finalizing.
+    assert_equal 1, DetectedImportJob.concurrency_limit
+    assert_equal DetectedImport::STUCK_IMPORTING_AFTER, DetectedImportJob.concurrency_duration
+    assert_equal :block, DetectedImportJob.concurrency_on_conflict
+    assert_equal(
+      DetectedImportJob.new(first.id).concurrency_key,
+      DetectedImportJob.new(first.id).concurrency_key
+    )
+    assert_not_equal(
+      DetectedImportJob.new(first.id).concurrency_key,
+      DetectedImportJob.new(second.id).concurrency_key,
+      "unrelated detections still import in parallel"
+    )
+  end
+
   private
 
-  def set_setting(key, value)
+  def set_setting(key, value, type: "string", category: "import")
     Setting.find_or_create_by(key: key).update!(
-      value: value, value_type: "string", category: "paths"
+      value: value, value_type: type, category: category
     )
   end
 end

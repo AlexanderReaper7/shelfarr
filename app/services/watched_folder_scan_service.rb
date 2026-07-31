@@ -1,25 +1,22 @@
 # frozen_string_literal: true
 
-# Scans the configured watched-folder import path for book files that were not
-# acquired through a Shelfarr request and records each new one as a
-# DetectedImport awaiting admin review. Read-only with respect to the watched
-# folder — it never moves, renames, or deletes source files.
+# Scans the configured watched-folder import path for book files not acquired
+# through a Shelfarr request, recording each new one as a DetectedImport awaiting
+# review. Read-only: it never moves, renames, or deletes source files.
 #
-# The walk uses FileCopyService's pinned, no-follow directory primitives so a
-# symlink or a mid-scan path swap can never redirect it outside the configured
-# root. Candidates are grouped the same way the download importer sees releases:
-# a single ebook/comic file, a self-contained audiobook folder, or — for a box
-# set / collection whose subfolders each hold a distinct title — one audiobook
-# per subfolder (see #classify_directory).
+# The walk uses FileCopyService's pinned, no-follow primitives, so a symlink or a
+# mid-scan path swap cannot redirect it outside the configured root. Candidates
+# are grouped the way the download importer sees releases: a single ebook/comic
+# file, a self-contained audiobook folder, or one audiobook per subfolder for a
+# collection (see #classify_directory).
 class WatchedFolderScanService
   MAX_DEPTH = 8
   AUDIO_SEARCH_DEPTH = 4
   MAX_CANDIDATES_PER_SCAN = 5_000
 
-  # Subfolder names that denote a disc/part of one audiobook rather than a
-  # distinct title: "CD1", "Disc 2", "Part 03", "Vol 1", "Tape 2", or a bare
-  # "1"/"01". Such folders must be kept together as a single multi-disc book,
-  # never split into separate books the way a titled subfolder is.
+  # Subfolder names denoting a disc/part of one audiobook rather than a distinct
+  # title ("CD1", "Disc 2", "Part 03", "Vol 1", a bare "01"). These stay together
+  # as one multi-disc book instead of splitting like a titled subfolder.
   DISC_SUBFOLDER = /\A(?:(?:cd|dis[ck]|part|pt|vol(?:ume)?|section|tape|track)[\s._-]*)?\d{1,3}\z/i
 
   Candidate = Struct.new(
@@ -34,15 +31,18 @@ class WatchedFolderScanService
 
   Result = Data.define(:scanned, :detected, :skipped)
 
+  # Accumulator for one walk: how many candidates it examined, and those not
+  # already accounted for by a detection or an acquired book.
+  Walk = Struct.new(:candidates, :scanned, keyword_init: true)
+
   def self.scan!
     new.scan!
   end
 
-  # The file embedded metadata should be read from for a given detection source:
-  # the source itself for a single file, or the first playable audio file inside
-  # an audiobook folder — the same one the scan picked when it recorded the
-  # detection. Used by the review page's Re-match so it reads what the scanner
-  # read. Falls back to the source when the folder holds no readable audio.
+  # Where embedded metadata should be read from: the source itself for a single
+  # file, or the first playable audio file inside an audiobook folder — the same
+  # one the scan picked. Used by the review page's Re-match so it reads what the
+  # scanner read. Falls back to the source when the folder holds no audio.
   def self.metadata_path_for(source_path)
     new.metadata_path_for(source_path)
   end
@@ -58,8 +58,7 @@ class WatchedFolderScanService
   # The canonical watched-folder root, or nil when the configured path is unset,
   # missing, or overlaps an output path. An import records it so undoing a move
   # can rebuild the source's parents and return the file through descriptors
-  # pinned to this root, rather than trusting the mutable parent path the
-  # importer happened to see.
+  # pinned to this root, rather than a mutable parent path.
   def self.import_root
     new.resolved_root
   end
@@ -91,17 +90,14 @@ class WatchedFolderScanService
       return nil
     end
 
-    candidates = build_candidates(root)
-    detected = 0
-    candidates.each do |candidate|
-      detected += 1 if record_candidate(candidate)
-    end
+    walked = build_candidates(root)
+    detected = walked.candidates.count { |candidate| record_candidate(candidate) }
 
     NotificationService.import_detected(count: detected) if detected.positive?
     Rails.logger.info(
-      "[WatchedFolderScanService] Scan complete: #{candidates.size} candidates, #{detected} new"
+      "[WatchedFolderScanService] Scan complete: #{walked.scanned} candidates, #{detected} new"
     )
-    Result.new(scanned: candidates.size, detected: detected, skipped: candidates.size - detected)
+    Result.new(scanned: walked.scanned, detected: detected, skipped: walked.scanned - detected)
   end
 
   private
@@ -109,95 +105,112 @@ class WatchedFolderScanService
   # --- Filesystem walk -----------------------------------------------------
 
   def build_candidates(root)
-    candidates = []
-    walk(root, root, 0, candidates)
-    candidates
+    walked = Walk.new(candidates: [], scanned: 0)
+    walk(root, root, 0, walked)
+    walked
   end
 
-  def walk(dir, root, depth, candidates)
+  def walk(dir, root, depth, walked)
     return if depth > MAX_DEPTH
-    return if candidates.size >= MAX_CANDIDATES_PER_SCAN
+    return if capped?(walked)
 
-    FileCopyService.directory_children(dir, root: root).each do |child|
-      break if candidates.size >= MAX_CANDIDATES_PER_SCAN
-      next if child.name.start_with?(".")
+    # The rescue below stays despite visible_children having its own: it also
+    # covers the loop body, where collect -> known? and the nested classification
+    # raise the same errors and must skip this directory, not abort the scan.
+    visible_children(dir, root).each do |child|
+      break if capped?(walked)
 
       path = File.join(dir, child.name)
       case child.type
       when :file
-        candidates << file_candidate(path, child) if LibraryAcquisitionService.readable_file?(child.name)
+        collect(walked, file_candidate(path, child)) if LibraryAcquisitionService.readable_file?(child.name)
         # Loose audio files directly under a directory become part of that
         # directory's audiobook candidate (below), never standalone imports.
       when :directory
-        classify_directory(path, child, root, depth, candidates)
+        classify_directory(path, child, root, depth, walked)
       end
     end
   rescue FileCopyService::UnsafePathError, SystemCallError => e
-    Rails.logger.warn "[WatchedFolderScanService] Skipping unreadable directory (#{e.class})"
+    Rails.logger.warn "[WatchedFolderScanService] Abandoning directory mid-walk (#{e.class})"
+  end
+
+  # One directory's entries minus dotfiles, through FileCopyService's pinned
+  # no-follow listing. An unreadable directory yields nothing, so the walk steps
+  # over it instead of failing the scan.
+  def visible_children(dir, root)
+    FileCopyService.directory_children(dir, root: root).reject { |child| child.name.start_with?(".") }
+  rescue FileCopyService::UnsafePathError, SystemCallError => e
+    Rails.logger.warn "[WatchedFolderScanService] Skipping unlistable directory (#{e.class})"
+    []
+  end
+
+  # Set aside a candidate the scan has not accounted for yet. Known ones are
+  # filtered here rather than at record time so they cost nothing against the
+  # cap: a copy or hardlink import never consumes its source, so a folder over
+  # MAX_CANDIDATES_PER_SCAN would otherwise re-walk the same already-imported
+  # first 5,000 every scan, and the files past them would never be detected.
+  def collect(walked, candidate)
+    walked.scanned += 1
+    walked.candidates << candidate unless known?(candidate)
+  end
+
+  def capped?(walked)
+    walked.candidates.size >= MAX_CANDIDATES_PER_SCAN
   end
 
   # Resolve how one directory maps onto audiobook candidates. Three shapes look
-  # alike from the top and have to be told apart:
+  # alike from the top:
   #
   #   * plain audiobook   Book/*.mp3              -> one candidate (this folder)
   #   * multi-disc book   Book/CD1/*.mp3, ...     -> one candidate (this folder)
   #   * collection/set    Set/Title A/*.mp3, ...  -> one candidate PER subfolder
   #
-  # The signal is where the audio lives. Loose audio directly in the folder
-  # means the folder itself is the release. Otherwise the audio sits in
-  # subfolders: if those are all disc markers (CD1, Disc 2, ...) the folder is a
-  # single multi-disc book; if any carries a real title the folder is a
-  # collection, so we descend and each audio-bearing subfolder becomes its own
-  # book (recursively — a nested subfolder may itself be multi-disc).
-  def classify_directory(dir, child, root, depth, candidates)
+  # The signal is where the audio lives. Loose audio directly in the folder means
+  # the folder is the release. Otherwise it sits in subfolders: all disc markers
+  # means one multi-disc book; any real title means a collection, so we descend
+  # and each audio-bearing subfolder becomes its own book (recursively, since a
+  # nested subfolder may itself be multi-disc).
+  def classify_directory(dir, child, root, depth, walked)
     direct = direct_audio_file(dir, root)
     if direct
-      candidates << audiobook_candidate(dir, child, direct)
+      collect(walked, audiobook_candidate(dir, child, direct))
       return
     end
 
     audio_subdirs = audio_bearing_subdirectories(dir, root)
     if audio_subdirs.empty?
       # No audio at any level yet: a plain intermediate folder — keep walking.
-      walk(dir, root, depth + 1, candidates)
+      walk(dir, root, depth + 1, walked)
     elsif audio_subdirs.all? { |name| disc_subfolder?(name) }
       # Discs of one book: import the whole folder as a single audiobook.
       nested = first_audio_file(dir, root, 0)
-      candidates << audiobook_candidate(dir, child, nested) if nested
+      collect(walked, audiobook_candidate(dir, child, nested)) if nested
     else
       # A collection: descend so each titled subfolder becomes its own book.
-      walk(dir, root, depth + 1, candidates)
+      walk(dir, root, depth + 1, walked)
     end
   end
 
-  # An audio file lying directly inside dir (not in any subfolder). Its presence
-  # marks dir as a self-contained audiobook release rather than a container of
-  # further releases.
+  # An audio file lying directly inside dir. Its presence marks dir as a
+  # self-contained release rather than a container of further releases.
   def direct_audio_file(dir, root)
-    FileCopyService.directory_children(dir, root: root).each do |child|
-      next if child.name.start_with?(".")
-
-      if child.type == :file && LibraryAcquisitionService.audio_file?(child.name)
-        return File.join(dir, child.name)
-      end
-    end
-    nil
-  rescue FileCopyService::UnsafePathError, SystemCallError
-    nil
+    audio_child(dir, visible_children(dir, root))
   end
 
-  # Names of the immediate subdirectories of dir that contain audio somewhere in
-  # their subtree. Empty when dir holds no nested audiobook material. Used to
-  # decide whether dir is a multi-disc book or a collection of separate books.
+  # The first playable audio file among an already-listed set of children.
+  def audio_child(dir, children)
+    child = children.find { |c| c.type == :file && LibraryAcquisitionService.audio_file?(c.name) }
+    File.join(dir, child.name) if child
+  end
+
+  # Immediate subdirectories of dir holding audio anywhere in their subtree, used
+  # to tell a multi-disc book from a collection of separate books.
   def audio_bearing_subdirectories(dir, root)
-    FileCopyService.directory_children(dir, root: root).filter_map do |child|
-      next if child.name.start_with?(".")
+    visible_children(dir, root).filter_map do |child|
       next unless child.type == :directory
 
       child.name if first_audio_file(File.join(dir, child.name), root, 0)
     end
-  rescue FileCopyService::UnsafePathError, SystemCallError
-    []
   end
 
   def disc_subfolder?(name)
@@ -209,23 +222,16 @@ class WatchedFolderScanService
   def first_audio_file(dir, root, depth)
     return nil if depth > AUDIO_SEARCH_DEPTH
 
-    children = FileCopyService.directory_children(dir, root: root)
-    children.each do |child|
-      next if child.name.start_with?(".")
+    children = visible_children(dir, root)
+    direct = audio_child(dir, children)
+    return direct if direct
 
-      if child.type == :file && LibraryAcquisitionService.audio_file?(child.name)
-        return File.join(dir, child.name)
-      end
-    end
     children.each do |child|
-      next if child.name.start_with?(".")
       next unless child.type == :directory
 
       found = first_audio_file(File.join(dir, child.name), root, depth + 1)
       return found if found
     end
-    nil
-  rescue FileCopyService::UnsafePathError, SystemCallError
     nil
   end
 
@@ -251,26 +257,23 @@ class WatchedFolderScanService
     )
   end
 
-  # Some filesystems (certain FUSE/network/overlay mounts) report a device or
-  # inode of 0 for every entry. A non-positive value is not a usable identity —
-  # keeping it would collapse unrelated files onto one (device, inode) key and
-  # make de-duplication drop all but the first file per device. Discard it so
-  # known? falls back to path-based de-duplication instead.
+  # Some FUSE/network/overlay mounts report device or inode 0 for every entry.
+  # Keeping a non-positive value would collapse unrelated files onto one key and
+  # make de-duplication drop all but the first file per device, so discard it and
+  # let known? fall back to path-based de-duplication.
   def reliable_identity(value)
     value.to_i.positive? ? value.to_i : nil
   end
 
   # --- Persistence ---------------------------------------------------------
 
-  # Returns true when a new DetectedImport was created.
+  # Persist a candidate the walk kept (already established as unknown). Returns
+  # true when a new DetectedImport was created.
   def record_candidate(candidate)
-    return false if known?(candidate)
-
-    # Local-only identification (metadata extract + library match). The online
-    # provider lookups are deferred to DetectedImportEnrichmentJob so a large
-    # first scan never fires thousands of sequential network searches inside a
-    # single run (which would also hold the scan's concurrency lease and stall
-    # the recurring chain).
+    # Local-only identification (metadata extract + library match). Online
+    # lookups are deferred to DetectedImportEnrichmentJob so a large first scan
+    # never fires thousands of sequential searches inside one run, holding the
+    # concurrency lease and stalling the recurring chain.
     identification = LibraryAcquisitionService.identify(
       source_path: candidate.metadata_path,
       book_type: candidate.book_type,
@@ -305,9 +308,11 @@ class WatchedFolderScanService
     if candidate.device && candidate.inode
       claim = DetectedImport.find_by(source_device: candidate.device, source_inode: candidate.inode)
       if claim
-        return true unless stale_identity?(claim, candidate)
-
-        release_identity!(claim)
+        case identity_state(claim, candidate)
+        when :match then return true
+        when :absent then retire_stale_detection!(claim)
+        else release_identity!(claim)
+        end
       end
     elsif DetectedImport.where(source_path: candidate.source_path).exists?
       # No reliable (device, inode) identity available — de-duplicate on the
@@ -319,27 +324,54 @@ class WatchedFolderScanService
     Book.acquired.where(file_path: candidate.source_path).exists?
   end
 
-  # A detection's (device, inode) claim is only meaningful while the file it was
-  # recorded for still carries that identity. A move import consumes its source,
-  # and the filesystem is then free to hand the inode to an unrelated file —
-  # which the unique index on the pair would otherwise make permanently
-  # undetectable. A claim held by a path that is gone, or that now has a
-  # different identity, is stale.
+  # How a detection's (device, inode) claim relates to the candidate now carrying
+  # that identity. The claim only means something while the file it was recorded
+  # for still holds it: a move import consumes its source, and the filesystem may
+  # then hand the inode to an unrelated file — which the unique index on the pair
+  # would otherwise make permanently undetectable.
   #
-  # Two live paths sharing one inode are a hardlink of the same content, not a
-  # recycled inode, so that case stays known.
-  def stale_identity?(claim, candidate)
-    return false if claim.source_path == candidate.source_path
+  # In FileCopyService's vocabulary, read here as:
+  #
+  #   :match    - still the file it was recorded for, or a hardlink to it
+  #   :absent   - the recorded path is gone: the identity travelled to the
+  #               candidate's path (a rename keeps the inode) or was consumed
+  #   :mismatch - a different file holds that path now, or it could not be read
+  def identity_state(claim, candidate)
+    return :match if claim.source_path == candidate.source_path
 
-    stat = File.lstat(claim.source_path)
-    [ stat.dev, stat.ino ] != [ candidate.device, candidate.inode ]
-  rescue SystemCallError
-    true
+    FileCopyService.path_identity_state(
+      claim.source_path, device: candidate.device, inode: candidate.inode
+    )
   end
 
-  # Drop the stale claim so the new occupant of the inode can be recorded under
-  # it. Written with update_columns: this is index bookkeeping, not a change to
-  # the detection worth broadcasting to the review screens.
+  # The source is gone from the recorded path while the same content is detected
+  # under a new one, so the row can never be imported — it would fail on the dead
+  # path — and nothing else prunes it. Left alone it sits in the queue forever
+  # beside the row replacing it, so retire it.
+  #
+  # Rows past review get their identity released and nothing more: an "importing"
+  # row is having its source consumed right now, an imported or dismissed row's
+  # path records where the file came from rather than a target, and a row holding
+  # a publication record needs it to reverse files an earlier attempt left behind.
+  def retire_stale_detection!(claim)
+    return release_identity!(claim) unless retirable?(claim)
+
+    claim.destroy
+    Rails.logger.info(
+      "[WatchedFolderScanService] Retired detection ##{claim.id}: its source moved to another path"
+    )
+  rescue => e
+    Rails.logger.warn "[WatchedFolderScanService] Could not retire a stale detection (#{e.class})"
+    release_identity!(claim)
+  end
+
+  def retirable?(claim)
+    DetectedImport::ACTIONABLE_STATUSES.include?(claim.status) && claim.publication_record.blank?
+  end
+
+  # Drop the stale claim so the inode's new occupant can be recorded under it.
+  # update_columns because this is index bookkeeping, not a change worth
+  # broadcasting to the review screens.
   def release_identity!(claim)
     claim.update_columns(source_device: nil, source_inode: nil, updated_at: Time.current)
   rescue => e
@@ -348,8 +380,8 @@ class WatchedFolderScanService
 
   # --- Path validation -----------------------------------------------------
 
-  # Refuse a watched path that is the same as, inside, or a parent of any
-  # configured output path — otherwise Shelfarr would re-detect its own imports.
+  # Refuse a watched path equal to, inside, or a parent of any configured output
+  # path — otherwise Shelfarr re-detects its own imports.
   def overlaps_output_paths?(canonical)
     output_roots.any? do |output|
       output == canonical || path_inside?(canonical, output) || path_inside?(output, canonical)
@@ -357,18 +389,27 @@ class WatchedFolderScanService
   end
 
   def output_roots
-    [
-      SettingsService.get(:audiobook_output_path, default: "/audiobooks"),
-      SettingsService.get(:ebook_output_path, default: "/ebooks"),
-      SettingsService.get(:comicbook_output_path, default: "/comics")
-    ].filter_map { |path| canonical_directory(path) }.uniq
+    PathTemplateService.output_roots.filter_map { |path| canonical_directory(path) }.uniq
   end
 
+  # The canonical form of an output path, which need not exist yet: on a first
+  # run none of them do, and skipping those would let the scanner adopt a root it
+  # is about to import into. So canonicalise the deepest existing ancestor and
+  # re-attach the components below it — enough to compare against a canonical
+  # root.
   def canonical_directory(path)
     expanded = File.expand_path(path.to_s)
-    return nil unless File.directory?(expanded)
+    existing = expanded
+    missing = []
+    until File.directory?(existing)
+      parent = File.dirname(existing)
+      return nil if parent == existing
 
-    File.realpath(expanded)
+      missing.unshift(File.basename(existing))
+      existing = parent
+    end
+
+    File.join(File.realpath(existing), *missing)
   rescue ArgumentError, SystemCallError
     nil
   end

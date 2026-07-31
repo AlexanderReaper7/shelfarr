@@ -40,6 +40,18 @@ class Admin::DetectedImportsControllerTest < ActionDispatch::IntegrationTest
     assert_select "turbo-frame#imported_history p", text: /Showing the #{preview} most recent of #{total}\./
   end
 
+  test "index renders the scanning state while a scan is running" do
+    create_detection(status: "detected", parsed_title: "Waiting For Review")
+
+    WatchedFolderScanJob.stub(:scan_status, { state: "running", started_at: Time.current }) do
+      get admin_detected_imports_url
+    end
+
+    assert_response :success
+    assert_select "button[disabled][aria-busy=?]", "true", text: /Scanning/
+    assert_select "svg.animate-spin", 2, "the shared spinner renders in the button and the status line"
+  end
+
   test "index expands the full imported history with imported=all" do
     total = Admin::DetectedImportsController::IMPORTED_PREVIEW_COUNT + 1
     total.times { |i| create_detection(status: "imported", parsed_title: "Imported Book #{i}") }
@@ -62,8 +74,32 @@ class Admin::DetectedImportsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "Watched-folder scan started.", flash[:notice]
   end
 
+  test "scan says so instead of claiming to start one while a scan is running" do
+    enable_watched_folder_import
+
+    # The job's concurrency key is declared on_conflict: :discard, so a second
+    # scan enqueued now would be thrown away without ever running.
+    assert_no_enqueued_jobs only: WatchedFolderScanJob do
+      WatchedFolderScanJob.stub(:scanning_now?, true) do
+        post scan_admin_detected_imports_url
+      end
+    end
+
+    assert_redirected_to admin_detected_imports_path
+    assert_match(/already running/, flash[:notice])
+  end
+
+  test "the disabled banner links to a settings tab that exists" do
+    set_setting("library_import_enabled", "false", type: "boolean")
+
+    get admin_detected_imports_url
+
+    assert_response :success
+    assert_select "a[href=?]", "#{admin_settings_path}#downloads", text: "Settings"
+  end
+
   test "scan is rejected when watched-folder import is disabled" do
-    set_setting("library_import_enabled", "false", "boolean", "import")
+    set_setting("library_import_enabled", "false", type: "boolean")
 
     assert_no_enqueued_jobs only: WatchedFolderScanJob do
       post scan_admin_detected_imports_url
@@ -174,6 +210,35 @@ class Admin::DetectedImportsControllerTest < ActionDispatch::IntegrationTest
     assert_equal "detected", detection.reload.status
   end
 
+  test "remove refuses while the file is still in the watched folder" do
+    file = File.join(Dir.mktmpdir("wf-remove"), "still-there.epub")
+    File.write(file, "dummy epub")
+    detection = DetectedImport.create!(
+      source_path: file, status: "dismissed", book_type: "ebook", parsed_title: "Still There"
+    )
+
+    assert_no_difference "DetectedImport.count" do
+      delete admin_detected_import_url(detection)
+    end
+
+    assert_redirected_to admin_detected_imports_path
+    assert_match(/still in your watched folder/, flash[:alert],
+      "removing the row would only hand the file back to the next scan")
+  ensure
+    FileUtils.rm_rf(File.dirname(file)) if file
+  end
+
+  test "remove prunes an entry whose source is gone" do
+    detection = create_detection(status: "dismissed", parsed_title: "Long Gone")
+
+    assert_difference "DetectedImport.count", -1 do
+      delete admin_detected_import_url(detection)
+    end
+
+    assert_redirected_to admin_detected_imports_path
+    assert_equal "Removed detection.", flash[:notice]
+  end
+
   test "undo reverses a completed import" do
     detection = create_detection(status: "imported", parsed_title: "Imported By Mistake")
 
@@ -207,11 +272,11 @@ class Admin::DetectedImportsControllerTest < ActionDispatch::IntegrationTest
   end
 
   def enable_watched_folder_import
-    set_setting("library_import_enabled", "true", "boolean", "import")
-    set_setting("library_import_path", Dir.mktmpdir("wf-controller"), "string", "import")
+    set_setting("library_import_enabled", "true", type: "boolean")
+    set_setting("library_import_path", Dir.mktmpdir("wf-controller"))
   end
 
-  def set_setting(key, value, type, category)
+  def set_setting(key, value, type: "string", category: "import")
     Setting.find_or_create_by(key: key).update!(
       value: value, value_type: type, category: category
     )
