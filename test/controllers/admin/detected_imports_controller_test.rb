@@ -113,6 +113,26 @@ class Admin::DetectedImportsControllerTest < ActionDispatch::IntegrationTest
     assert_match(/can no longer be imported/, flash[:alert])
   end
 
+  test "the queue's one-click Import submits the match the row displays" do
+    detection = create_detection(status: "detected", parsed_title: "Wrongly Parsed Title")
+    match = Book.create!(title: "The Real Title", author: "Brandon Sanderson", book_type: :ebook)
+    detection.update!(candidate_books: [
+      { "kind" => "library", "book_id" => match.id, "title" => "The Real Title", "score" => 99 }
+    ])
+
+    get admin_detected_imports_url
+
+    assert_response :success
+    assert_select "form[action=?] input[name=selection][value=?]",
+      import_admin_detected_import_path(detection), "book:#{match.id}"
+
+    # Following that form resolves the displayed candidate rather than falling
+    # back to the filename parse and inventing a book from it.
+    post import_admin_detected_import_url(detection), params: { selection: detection.default_selection }
+
+    assert_equal match, detection.reload.suggested_book
+  end
+
   test "rematch reads embedded metadata from inside an audiobook folder" do
     release = File.join(Dir.mktmpdir("wf-rematch"), "Warbreaker")
     FileUtils.mkdir_p(release)

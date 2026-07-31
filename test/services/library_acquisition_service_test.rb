@@ -112,7 +112,7 @@ class LibraryAcquisitionServiceTest < ActiveSupport::TestCase
     )
     book = Book.create!(title: "Warbreaker", author: "Brandon Sanderson", book_type: :ebook)
     result = LibraryAcquisitionService.import!(
-      source_path: source, book: book, owner: detection, mode: "move"
+      source_path: source, book: book, owner: detection, mode: "move", source_base: @source_dir
     )
     detection.update!(status: "imported", imported_book: result.book, suggested_book: result.book)
     assert_not File.exist?(source), "move consumed the source"
@@ -218,7 +218,7 @@ class LibraryAcquisitionServiceTest < ActiveSupport::TestCase
     assert_raises LibraryAcquisitionService::AcquisitionConflictError do
       LibraryAcquisitionService.stub(:claim_file_path!, conflict) do
         LibraryAcquisitionService.import!(
-          source_path: source, book: book, owner: detection, mode: "move"
+          source_path: source, book: book, owner: detection, mode: "move", source_base: @source_dir
         )
       end
     end
@@ -229,6 +229,171 @@ class LibraryAcquisitionServiceTest < ActiveSupport::TestCase
     assert_nil book.reload.file_path
     assert_not book.acquired?
     assert_nil detection.reload.publication_record
+  end
+
+  test "import! fails instead of committing an import it could not journal" do
+    set_setting("completed_download_import_mode", "move")
+    source = File.join(@source_dir, "Brandon Sanderson - Elantris.epub")
+    File.write(source, "dummy epub bytes")
+    book = Book.create!(title: "Elantris", author: "Brandon Sanderson", book_type: :ebook)
+    detection = DetectedImport.create!(source_path: source, status: "importing", book_type: "ebook")
+
+    unwritable = lambda do |*|
+      raise ActiveRecord::StatementInvalid, "journal write failed"
+    end
+
+    assert_raises ActiveRecord::StatementInvalid do
+      LibraryAcquisitionService.stub(:record_publication!, unwritable) do
+        LibraryAcquisitionService.import!(
+          source_path: source, book: book, owner: detection, mode: "move", source_base: @source_dir
+        )
+      end
+    end
+
+    assert File.exist?(source), "the move is reversed while the in-memory record is still available"
+    assert_empty Dir.glob(File.join(@ebook_dest, "**", "*.epub")),
+      "an import whose journal could not persist never keeps its library artifact"
+    assert_not book.reload.acquired?
+  end
+
+  test "undo_import! keeps the journal until the state reset commits" do
+    source = File.join(@source_dir, "Brandon Sanderson - Elantris.epub")
+    File.write(source, "dummy epub bytes")
+    detection = DetectedImport.create!(
+      source_path: source, status: "importing", book_type: "ebook", parsed_title: "Elantris"
+    )
+    book = Book.create!(title: "Elantris", author: "Brandon Sanderson", book_type: :ebook)
+    result = LibraryAcquisitionService.import!(
+      source_path: source, book: book, owner: detection, mode: "copy", source_base: @source_dir
+    )
+    detection.update!(status: "imported", imported_book: result.book, suggested_book: result.book)
+
+    failing = ->(*) { raise ActiveRecord::RecordInvalid.new(book) }
+    assert_raises ActiveRecord::RecordInvalid do
+      LibraryAcquisitionService.stub(:release_book_after_undo!, failing) do
+        LibraryAcquisitionService.undo_import!(detection)
+      end
+    end
+
+    detection.reload
+    assert_equal "imported", detection.status, "the transaction rolled the state back"
+    assert detection.publication_record.present?,
+      "so the journal has to survive too — without it a retried undo has nothing to work from"
+
+    # And the retry succeeds: every reversal step is idempotent, so the already
+    # removed file simply reads as absent.
+    LibraryAcquisitionService.undo_import!(detection)
+    assert_equal "detected", detection.reload.status
+    assert_nil detection.publication_record
+  end
+
+  test "undo_import! refuses to restore over a source path taken by a different file" do
+    set_setting("completed_download_import_mode", "move")
+    source = File.join(@source_dir, "Brandon Sanderson - Warbreaker.epub")
+    File.write(source, "dummy epub bytes")
+    detection = DetectedImport.create!(
+      source_path: source, status: "importing", book_type: "ebook", parsed_title: "Warbreaker"
+    )
+    book = Book.create!(title: "Warbreaker", author: "Brandon Sanderson", book_type: :ebook)
+    result = LibraryAcquisitionService.import!(
+      source_path: source, book: book, owner: detection, mode: "move", source_base: @source_dir
+    )
+    detection.update!(status: "imported", imported_book: result.book, suggested_book: result.book)
+
+    # Unrelated bytes take over the pathname the move freed.
+    File.write(source, "somebody else's file")
+
+    assert_raises LibraryAcquisitionService::AcquisitionConflictError do
+      LibraryAcquisitionService.undo_import!(detection)
+    end
+
+    assert_equal "somebody else's file", File.read(source), "the occupant is left alone"
+    assert File.exist?(result.destination_path),
+      "and the library keeps the only surviving copy of the imported bytes"
+    assert_equal "imported", detection.reload.status
+  end
+
+  test "undo_import! will not restore through a swapped source ancestor symlink" do
+    set_setting("completed_download_import_mode", "move")
+    release = File.join(@source_dir, "Warbreaker")
+    FileUtils.mkdir_p(release)
+    File.write(File.join(release, "01 - Chapter One.mp3"), "chapter one bytes")
+    book = Book.create!(title: "Warbreaker", author: "Brandon Sanderson", book_type: :audiobook)
+    detection = DetectedImport.create!(source_path: release, status: "importing", book_type: "audiobook")
+    result = LibraryAcquisitionService.import!(
+      source_path: release, book: book, owner: detection, mode: "move", source_base: @source_dir
+    )
+    detection.update!(status: "imported", imported_book: result.book, suggested_book: result.book)
+    assert_not File.exist?(release), "move consumed the source tree"
+
+    outside = Dir.mktmpdir("laq-outside-source")
+    File.symlink(outside, release)
+
+    assert_raises LibraryAcquisitionService::AcquisitionConflictError do
+      LibraryAcquisitionService.undo_import!(detection)
+    end
+
+    assert_empty Dir.glob(File.join(outside, "**", "*.mp3")),
+      "the restore walks the watched-folder root through pinned descriptors, not the recorded parent"
+    assert File.exist?(File.join(result.destination_path, "01 - Chapter One.mp3")),
+      "and the library copy is kept rather than moved somewhere unreachable"
+  ensure
+    FileUtils.rm_rf(outside) if outside
+  end
+
+  test "import! reverses an interrupted publication instead of re-importing a consumed source" do
+    set_setting("completed_download_import_mode", "move")
+    source = File.join(@source_dir, "Brandon Sanderson - Elantris.epub")
+    File.write(source, "dummy epub bytes")
+    book = Book.create!(title: "Elantris", author: "Brandon Sanderson", book_type: :ebook)
+    detection = DetectedImport.create!(source_path: source, status: "importing", book_type: "ebook")
+
+    # Stand in for a worker killed after the journal was persisted but before
+    # the book claim. Interrupt is not a StandardError, so import!'s rollback
+    # never runs: the source stays consumed and the bytes sit in the library,
+    # exactly as a hard kill leaves them.
+    interrupted = ->(*) { raise Interrupt }
+    assert_raises Interrupt do
+      LibraryAcquisitionService.stub(:claim_file_path!, interrupted) do
+        LibraryAcquisitionService.import!(
+          source_path: source, book: book, owner: detection, mode: "move", source_base: @source_dir
+        )
+      end
+    end
+    assert_not File.exist?(source), "the interrupted attempt left the source consumed"
+    assert detection.reload.publication_record.present?, "and its journal behind"
+
+    result = LibraryAcquisitionService.import!(
+      source_path: source, book: book, owner: detection, mode: "move", source_base: @source_dir
+    )
+
+    assert File.exist?(result.destination_path), "the retry publishes from the restored source"
+    assert_not File.exist?(source), "which this second move consumes in turn"
+    assert detection.reload.source_identity.present?,
+      "the restored source's new identity is recorded so the retry can verify it"
+    assert book.reload.acquired?
+  end
+
+  test "import! resumes an interrupted attempt that already claimed the book" do
+    source = File.join(@source_dir, "Brandon Sanderson - Mistborn.epub")
+    File.write(source, "dummy epub bytes")
+    book = Book.create!(title: "Mistborn", author: "Brandon Sanderson", book_type: :ebook)
+    detection = DetectedImport.create!(source_path: source, status: "importing", book_type: "ebook")
+
+    first = LibraryAcquisitionService.import!(
+      source_path: source, book: book, owner: detection, mode: "copy", source_base: @source_dir
+    )
+    # The worker died before recording "imported", so the journal is still set
+    # and a redelivery runs the whole import again.
+    published = Dir.glob(File.join(@ebook_dest, "**", "*.epub"))
+
+    result = LibraryAcquisitionService.import!(
+      source_path: source, book: book, owner: detection, mode: "copy", source_base: @source_dir
+    )
+
+    assert_equal first.destination_path, result.destination_path
+    assert_equal published, Dir.glob(File.join(@ebook_dest, "**", "*.epub")),
+      "a completed import is handed back rather than publishing a numbered duplicate"
   end
 
   test "undo_import! leaves pre-existing files in a shared destination directory" do

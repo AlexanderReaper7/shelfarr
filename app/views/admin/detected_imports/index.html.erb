@@ -103,7 +103,11 @@
               <td class="px-6 py-4 whitespace-nowrap text-right text-sm">
                 <% if item.actionable? %>
                   <div class="flex items-center justify-end gap-2">
+                    <%# Submit the match this row displays. Without it the import falls
+                        back to the filename parse and invents a new book, ignoring the
+                        suggestion the admin is approving by clicking Import. %>
                     <%= button_to "Import", import_admin_detected_import_path(item), method: :post,
+                          params: { selection: item.default_selection },
                           class: "px-3 py-1 bg-green-600 hover:bg-green-500 text-white rounded transition cursor-pointer" %>
                     <%= link_to "Review", admin_detected_import_path(item),
                           class: "px-3 py-1 bg-gray-700 hover:bg-gray-600 text-gray-200 rounded transition inline-block" %>

@@ -55,6 +55,31 @@ class WatchedFolderScanService
     source_path
   end
 
+  # The canonical watched-folder root, or nil when the configured path is unset,
+  # missing, or overlaps an output path. An import records it so undoing a move
+  # can rebuild the source's parents and return the file through descriptors
+  # pinned to this root, rather than trusting the mutable parent path the
+  # importer happened to see.
+  def self.import_root
+    new.resolved_root
+  end
+
+  def resolved_root
+    raw = SettingsService.get(:library_import_path).to_s.strip
+    return nil if raw.blank?
+
+    expanded = File.expand_path(raw)
+    return nil unless File.directory?(expanded)
+
+    canonical = File.realpath(expanded)
+    return nil if Pathname(canonical).root?
+    return nil if overlaps_output_paths?(canonical)
+
+    canonical
+  rescue ArgumentError, SystemCallError
+    nil
+  end
+
   # Returns a Result summarising the scan, or nil when scanning is disabled or
   # the configured path is invalid.
   def scan!
@@ -322,22 +347,6 @@ class WatchedFolderScanService
   end
 
   # --- Path validation -----------------------------------------------------
-
-  def resolved_root
-    raw = SettingsService.get(:library_import_path).to_s.strip
-    return nil if raw.blank?
-
-    expanded = File.expand_path(raw)
-    return nil unless File.directory?(expanded)
-
-    canonical = File.realpath(expanded)
-    return nil if Pathname(canonical).root?
-    return nil if overlaps_output_paths?(canonical)
-
-    canonical
-  rescue ArgumentError, SystemCallError
-    nil
-  end
 
   # Refuse a watched path that is the same as, inside, or a parent of any
   # configured output path — otherwise Shelfarr would re-detect its own imports.

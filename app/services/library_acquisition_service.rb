@@ -28,6 +28,11 @@ class LibraryAcquisitionService
   # Outcome of a successful import into the organised library.
   ImportResult = Data.define(:book, :destination_path, :mode, :publication)
 
+  # What a retry found left behind by an interrupted attempt: either a result to
+  # hand straight back, or the source identity to import against once the
+  # stranded publication has been reversed.
+  Recovery = Data.define(:result, :reversed, :source_identity)
+
   # Read-only identification result. +candidate_books+ is a ranked array of
   # plain hashes safe to persist as JSON on a DetectedImport.
   Identification = Data.define(
@@ -111,14 +116,21 @@ class LibraryAcquisitionService
     #               detected. The importer refuses to publish a source whose
     #               inode no longer matches, so a path swapped between approval
     #               and import cannot substitute different bytes.
+    # source_base - the root the source was found under (the watched folder),
+    #               recorded on the publication so undo can restore a moved file
+    #               through descriptors pinned to that root.
     #
     # The publication record is persisted on +owner+ before the database claim,
     # so a crash or a lost claim race can still be reversed precisely: bytes are
     # already on disk at that point and only an exact record of them makes the
     # rollback safe.
-    def import!(source_path:, book:, owner:, mode: nil, provenance: nil, source_identity: nil)
+    def import!(source_path:, book:, owner:, mode: nil, provenance: nil, source_identity: nil, source_base: nil)
       mode = (mode || SettingsService.get(:completed_download_import_mode, default: "copy")).to_s
       base_path = output_base_path(book)
+
+      recovered = recover_interrupted_publication!(owner, book, source_identity)
+      return recovered.result if recovered.result
+      source_identity = recovered.source_identity if recovered.reversed
 
       reserve_book!(book, owner)
       importer = LibraryFileImporter.new(mode: mode)
@@ -128,7 +140,8 @@ class LibraryAcquisitionService
           source: source_path,
           book: book,
           base_path: base_path,
-          expected_source_identity: source_identity
+          expected_source_identity: source_identity,
+          source_base: source_base
         )
         record_publication!(owner, result.publication)
 
@@ -152,13 +165,18 @@ class LibraryAcquisitionService
         # import that failed partway through: the importer's record covers every
         # file it managed to publish before raising. A reversal that could not
         # finish is logged rather than raised — the original failure is the one
-        # worth reporting — but the record is left behind so undo can retry it.
-        unless claimed || reverse_publication!(importer.publication_record, owner)
+        # worth reporting — and its record is left behind so the next attempt
+        # (or an undo) can retry the reversal.
+        reversed = claimed || reverse_publication!(importer.publication_record, owner)
+        unless reversed
           Rails.logger.error(
             "[LibraryAcquisitionService] Could not fully reverse the failed import for book ##{book.id}; " \
               "some published files remain in the library"
           )
         end
+        # A reversed move put the source back on a fresh inode, so the identity
+        # recorded at detection would fail the next attempt's check.
+        refresh_source_identity!(owner) if reversed && !claimed && mode == "move"
         release_reservation!(book, owner)
         raise
       end
@@ -183,7 +201,13 @@ class LibraryAcquisitionService
         # no longer the one this import published (renamed, re-tagged, replaced)
         # is left alone, and un-acquiring the book anyway would strand it in the
         # library and let a re-import duplicate it.
-        unless reverse_publication!(publication, detected_import)
+        #
+        # The journal is deliberately not cleared here: it is the only durable
+        # description of what this import put on disk, and the transaction below
+        # can still fail (or the process die) after the files have moved. It is
+        # cleared by that transaction, so until it commits a retried undo still
+        # has a record to work from — every step below is idempotent.
+        unless reverse_publication!(publication, detected_import, clear_record: false)
           raise AcquisitionConflictError,
             "Refusing to undo: the file this import published could not be returned or removed — it has been " \
             "renamed, replaced, or moved since. Resolve it under #{publication['base_path']} and try again."
@@ -259,6 +283,73 @@ class LibraryAcquisitionService
 
     private
 
+    # An owner that already carries a publication record reached durable state on
+    # an earlier attempt: bytes are on disk and, for a move, the source is gone.
+    # Re-running the import from that source would read a path that no longer
+    # exists and fail, leaving the bytes, the journal, and the reservation
+    # stranded with no way to undo. So reconcile that phase first.
+    #
+    # If the earlier attempt also claimed the book, the import actually finished
+    # and only the caller's bookkeeping was lost — hand back its result rather
+    # than publishing a second copy. Otherwise reverse it, which returns a moved
+    # source to the watched folder, and import again from there.
+    def recover_interrupted_publication!(owner, book, source_identity)
+      record = owner.respond_to?(:publication_record) ? owner.publication_record.presence : nil
+      return Recovery.new(result: nil, reversed: false, source_identity: nil) if record.blank?
+
+      book.reload
+      if publication_claimed_by?(record, book)
+        Rails.logger.info(
+          "[LibraryAcquisitionService] Resuming interrupted import for book ##{book.id}; the library file is already claimed"
+        )
+        # The interrupted attempt may have died before announcing the file.
+        trigger_library_scan(book)
+        return Recovery.new(
+          result: ImportResult.new(
+            book: book,
+            destination_path: book.file_path,
+            mode: record["mode"].to_s,
+            publication: record
+          ),
+          reversed: false,
+          source_identity: nil
+        )
+      end
+
+      # The dead attempt's reservation would otherwise block reserve_book!.
+      # release_reservation! only touches a reservation still held by this owner
+      # on an unclaimed book, which is exactly the interrupted case.
+      release_reservation!(book, owner)
+      unless reverse_publication!(record, owner)
+        raise AcquisitionConflictError,
+          "An earlier import attempt was interrupted and its files could not be reversed. " \
+          "Resolve them under #{record['base_path']} and try again."
+      end
+
+      # A reversed move put the source back on a fresh inode (the restore is a
+      # durable copy plus an unlink, not a rename), so the identity the caller
+      # is about to import against has to be re-read. A copy or hardlink never
+      # touched the source, so its recorded identity still stands.
+      identity = record["mode"].to_s == "move" ? refresh_source_identity!(owner) : source_identity
+      Rails.logger.warn(
+        "[LibraryAcquisitionService] Reversed an interrupted import for book ##{book.id} before retrying"
+      )
+      Recovery.new(result: nil, reversed: true, source_identity: identity)
+    end
+
+    # Whether the book's claimed file_path is what this publication produced —
+    # the file it published, or the per-book directory it published into.
+    def publication_claimed_by?(record, book)
+      claimed = book.file_path.presence
+      return false if claimed.blank?
+
+      destinations = Array(record["files"]).filter_map { |entry| entry["destination"].presence }
+      return false if destinations.empty?
+
+      destinations.include?(claimed) ||
+        destinations.all? { |destination| destination.start_with?(File.join(claimed, "")) }
+    end
+
     # Reserve the book under a row lock so a concurrent acquisition (upload or
     # download) cannot claim the same title while the file import runs outside
     # the transaction. Raises if the title is already acquired or reserved.
@@ -320,14 +411,17 @@ class LibraryAcquisitionService
     # Persist what an import published so a later rollback or undo can reverse
     # exactly those entries. Written with update_columns so an in-flight import
     # neither runs validations nor broadcasts a status change.
+    #
+    # A failure here is fatal on purpose. The bytes are already on disk and a
+    # move has already consumed the source, so this write is the only durable
+    # thing that can reverse them; committing the import without it would leave
+    # an acquired book whose undo has nothing to work from. Raising instead
+    # sends the caller into the rollback below, which reverses the in-memory
+    # record while it is still available.
     def record_publication!(owner, publication)
       return unless owner.respond_to?(:publication_record=) && owner.persisted?
 
       owner.update_columns(publication_record: publication, updated_at: Time.current)
-    rescue => e
-      Rails.logger.error(
-        "[LibraryAcquisitionService] Failed to record publication for #{owner.class.name} ##{owner.id} (#{e.class})"
-      )
     end
 
     # Reverse exactly the entries this import published: discard the files it
@@ -348,19 +442,24 @@ class LibraryAcquisitionService
     # the library still holds an artifact this import put there. The record is
     # kept in that case so undo can be retried once the admin has resolved it;
     # every step is idempotent, so a retry re-reverses only what is left.
-    def reverse_publication!(publication, owner)
+    #
+    # +clear_record+ drops the journal once the reversal is complete. Callers
+    # that still have durable state to commit afterwards pass false and clear it
+    # themselves, so a failure in that window leaves a record to retry from.
+    def reverse_publication!(publication, owner, clear_record: true)
       publication = publication.presence || {}
       files = Array(publication["files"])
       root = publication["base_path"].presence
       return files.empty? if root.blank?
 
       move = publication["mode"].to_s == "move"
+      source_base = publication["source_base"].presence
       complete = files.reverse_each.map { |entry|
-        move ? restore_moved_file!(entry, root) : discard_published_file!(entry, root)
+        move ? restore_moved_file!(entry, root, source_base) : discard_published_file!(entry, root)
       }.all?
       Array(publication["directories"]).reverse_each { |entry| discard_created_directory!(entry, root) }
 
-      clear_publication_record!(owner) if complete
+      clear_publication_record!(owner) if complete && clear_record
       complete
     end
 
@@ -402,18 +501,19 @@ class LibraryAcquisitionService
     # Move: the source is gone, so return this file to the path the scanner
     # recorded for it. Restoring per file rebuilds a moved directory tree
     # exactly as it was found. Returns true when the entry is reversed.
-    def restore_moved_file!(entry, root)
+    def restore_moved_file!(entry, root, source_base)
       destination = entry["destination"].presence
       source = entry["source"].presence
       return true if destination.blank? || source.blank?
 
-      # A directory move publishes every file before unlinking the source tree,
-      # so a reversal partway through finds the source still in place. The
-      # library copy is then redundant rather than the only surviving one. The
-      # same branch makes a retried undo a no-op for entries already returned.
-      return discard_published_file!(entry, root) if File.exist?(source)
-
-      unless published_file_state(entry, root) == :match
+      # The library artifact decides what is left to do. Gone means this entry
+      # was already reversed (a retried undo, or a restore that completed), and
+      # a mismatch means something else now owns the path and must not be
+      # touched — neither case may consult the source, whose path can since have
+      # been taken over by unrelated bytes.
+      case published_file_state(entry, root)
+      when :absent then return true
+      when :mismatch
         Rails.logger.warn(
           "[LibraryAcquisitionService] Could not return #{destination} to #{source}: " \
             "it is no longer the file this import published"
@@ -421,10 +521,47 @@ class LibraryAcquisitionService
         return false
       end
 
-      FileUtils.mkdir_p(File.dirname(source))
+      case moved_source_state(entry)
+      when :absent then restore_to_source!(entry, root, source_base)
+      when :match
+        # A directory move publishes every file before unlinking the source
+        # tree, so a reversal partway through finds the original source still in
+        # place. The library copy is then redundant rather than the only
+        # surviving one.
+        discard_published_file!(entry, root)
+      else
+        # Something occupies the source path that is not what this import took
+        # from it. Removing the library copy would destroy the only surviving
+        # bytes, and overwriting the occupant would destroy someone else's.
+        Rails.logger.warn(
+          "[LibraryAcquisitionService] Left #{destination} in the library during undo: " \
+            "#{source} is occupied by a different file"
+        )
+        false
+      end
+    end
+
+    # Return the library artifact to the path the scanner recorded, rebuilding
+    # any parent directories the move left empty. Both the mkdir and the
+    # publication walk from the watched-folder root through pinned O_NOFOLLOW
+    # descriptors, so a source ancestor swapped for a symlink since the import
+    # cannot redirect the restore outside the watched folder. Without a recorded
+    # root there is nothing safe to pin against, so the restore is refused.
+    def restore_to_source!(entry, root, source_base)
+      destination = entry["destination"]
+      source = entry["source"]
+      if source_base.blank?
+        Rails.logger.warn(
+          "[LibraryAcquisitionService] Could not return #{destination} to #{source}: " \
+            "the import recorded no watched-folder root to restore through"
+        )
+        return false
+      end
+
+      FileCopyService.ensure_directory(File.dirname(source), root: source_base)
       FileCopyService.mv_noreplace(
         destination, source,
-        root: File.dirname(source), allow_compatibility_fallback: true
+        root: source_base, allow_compatibility_fallback: true
       )
       true
     rescue FileCopyService::UnsafePathError, FileCopyService::AtomicPublicationUnsupportedError, SystemCallError => e
@@ -432,6 +569,26 @@ class LibraryAcquisitionService
         "[LibraryAcquisitionService] Could not return #{entry['destination']} to #{entry['source']} (#{e.class})"
       )
       false
+    end
+
+    # Whether the source path still holds the file this import moved out of it.
+    # An import that recorded no source identity cannot prove it either way, so
+    # an occupied path counts as a mismatch rather than an assumed match.
+    #
+    #   :absent    - the move consumed it and nothing has taken the path since
+    #   :match     - the original file is still there (a partly-reversed move)
+    #   :mismatch  - a different file now occupies the path
+    def moved_source_state(entry)
+      stat = File.lstat(entry["source"])
+      device = entry["source_device"]
+      inode = entry["source_inode"]
+      return :mismatch if device.blank? || inode.blank?
+
+      [ stat.dev, stat.ino ] == [ device, inode ] ? :match : :mismatch
+    rescue Errno::ENOENT, Errno::ENOTDIR
+      :absent
+    rescue SystemCallError
+      :mismatch
     end
 
     # Drop a directory this import created, but only while it is still exactly
@@ -484,15 +641,26 @@ class LibraryAcquisitionService
     # (the restore is a durable copy followed by an unlink, not a rename), so
     # the identity recorded at detection no longer describes it. Re-record it,
     # or drop it when it cannot be read — the importer treats a missing identity
-    # as "unverifiable" rather than refusing the re-import outright.
+    # as "unverifiable" rather than refusing the re-import outright. Returns the
+    # identity now recorded, or nil when it could not be read.
     def refresh_source_identity!(detected_import)
+      return nil unless detected_import.respond_to?(:source_device=)
+
       stat = File.lstat(detected_import.source_path)
       detected_import.update_columns(
         source_device: stat.dev, source_inode: stat.ino, updated_at: Time.current
       )
-    rescue SystemCallError, ActiveRecord::RecordNotUnique => e
+      [ stat.dev, stat.ino ]
+    rescue => e
+      # Never raise: this also runs while unwinding a failed import, where the
+      # original error is the one worth reporting.
       Rails.logger.warn("[LibraryAcquisitionService] Clearing source identity after undo (#{e.class})")
-      detected_import.update_columns(source_device: nil, source_inode: nil, updated_at: Time.current)
+      begin
+        detected_import.update_columns(source_device: nil, source_inode: nil, updated_at: Time.current)
+      rescue => inner
+        Rails.logger.warn("[LibraryAcquisitionService] Could not clear source identity (#{inner.class})")
+      end
+      nil
     end
 
     # Un-acquire the book and destroy it when it was a throwaway created solely
