@@ -92,6 +92,10 @@ class PostProcessingJob < ApplicationJob
       destination = build_destination_path(book, base_path: base_path)
       source_resolution = remap_download_path(download.download_path, download)
       source_path = source_resolution[:path]
+      if source_path_unavailable?(source_path) && refresh_download_path_from_client!(download)
+        source_resolution = remap_download_path(download.download_path, download)
+        source_path = source_resolution[:path]
+      end
       if source_path_unavailable?(source_path)
         return retry_source_path_later(download, request, source_path, source_path_retry_count)
       end
@@ -412,6 +416,36 @@ class PostProcessingJob < ApplicationJob
 
   def path_inside_root?(path, root)
     path.start_with?("#{root}#{File::SEPARATOR}")
+  end
+
+  # download_path is captured once, when DownloadMonitorJob observes completion.
+  # A client that relocates content afterwards (a category or save-path change in
+  # qBittorrent, a completed-folder move) leaves that stored path pointing at
+  # somewhere this container cannot see, and every retry re-checks the same dead
+  # path. Ask the client where the content lives now before waiting again.
+  #
+  # Returns true only when a different path was stored, so the caller knows a
+  # re-resolve is worth attempting.
+  def refresh_download_path_from_client!(download)
+    return false if download.external_id.blank?
+
+    client = download.download_client&.adapter
+    return false unless client
+
+    current_path = client.torrent_info(download.external_id)&.download_path
+    return false if current_path.blank? || current_path == download.download_path
+
+    download.update!(download_path: current_path)
+    Rails.logger.info(
+      "[PostProcessingJob] Download ##{download.id} moved since it completed; " \
+        "refreshed its path from the download client"
+    )
+    true
+  rescue => e
+    # A client that is down or does not support lookups just means we fall back
+    # to the stored path and the existing retry/backoff.
+    Rails.logger.warn "[PostProcessingJob] Could not refresh path for download ##{download.id} (#{e.class})"
+    false
   end
 
   def retry_source_path_later(download, request, source_path, retry_count)
