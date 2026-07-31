@@ -72,6 +72,45 @@ class DetectedImportJobTest < ActiveJob::TestCase
     assert_equal "importing", detection.reload.status
   end
 
+  test "refuses to import a source that was replaced after it was detected" do
+    source = File.join(@source_dir, "Brandon Sanderson - Elantris.epub")
+    File.write(source, "the approved book")
+    stat = File.stat(source)
+    detection = DetectedImport.create!(
+      source_path: source, status: "detected", book_type: "ebook",
+      parsed_title: "Elantris", parsed_author: "Brandon Sanderson",
+      source_device: stat.dev, source_inode: stat.ino
+    )
+
+    # Atomically swap the approved path for different content on a new inode.
+    replacement = File.join(@source_dir, "replacement.epub")
+    File.write(replacement, "something else entirely")
+    File.rename(replacement, source)
+
+    DetectedImportJob.perform_now(detection.id)
+
+    detection.reload
+    assert_equal "failed", detection.status
+    assert_empty Dir.glob(File.join(@ebook_dest, "**", "*.epub")),
+      "the substituted bytes are never published under the approved title"
+  end
+
+  test "imports a source whose recorded identity still matches" do
+    source = File.join(@source_dir, "Brandon Sanderson - Elantris.epub")
+    File.write(source, "the approved book")
+    stat = File.stat(source)
+    detection = DetectedImport.create!(
+      source_path: source, status: "detected", book_type: "ebook",
+      parsed_title: "Elantris", parsed_author: "Brandon Sanderson",
+      source_device: stat.dev, source_inode: stat.ino
+    )
+
+    DetectedImportJob.perform_now(detection.id)
+
+    assert_equal "imported", detection.reload.status
+    assert File.exist?(File.join(@ebook_dest, "Brandon Sanderson", "Elantris", "Brandon Sanderson - Elantris.epub"))
+  end
+
   test "does not re-import a detection that is already imported" do
     detection = DetectedImport.create!(source_path: "/x", status: "imported")
 

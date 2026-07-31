@@ -38,6 +38,23 @@ class WatchedFolderScanService
     new.scan!
   end
 
+  # The file embedded metadata should be read from for a given detection source:
+  # the source itself for a single file, or the first playable audio file inside
+  # an audiobook folder — the same one the scan picked when it recorded the
+  # detection. Used by the review page's Re-match so it reads what the scanner
+  # read. Falls back to the source when the folder holds no readable audio.
+  def self.metadata_path_for(source_path)
+    new.metadata_path_for(source_path)
+  end
+
+  def metadata_path_for(source_path)
+    return source_path unless File.directory?(source_path)
+
+    first_audio_file(source_path, source_path, 0) || source_path
+  rescue SystemCallError
+    source_path
+  end
+
   # Returns a Result summarising the scan, or nil when scanning is disabled or
   # the configured path is invalid.
   def scan!
@@ -261,7 +278,12 @@ class WatchedFolderScanService
 
   def known?(candidate)
     if candidate.device && candidate.inode
-      return true if DetectedImport.where(source_device: candidate.device, source_inode: candidate.inode).exists?
+      claim = DetectedImport.find_by(source_device: candidate.device, source_inode: candidate.inode)
+      if claim
+        return true unless stale_identity?(claim, candidate)
+
+        release_identity!(claim)
+      end
     elsif DetectedImport.where(source_path: candidate.source_path).exists?
       # No reliable (device, inode) identity available — de-duplicate on the
       # source path instead, so files on inode-less filesystems still surface
@@ -270,6 +292,33 @@ class WatchedFolderScanService
     end
 
     Book.acquired.where(file_path: candidate.source_path).exists?
+  end
+
+  # A detection's (device, inode) claim is only meaningful while the file it was
+  # recorded for still carries that identity. A move import consumes its source,
+  # and the filesystem is then free to hand the inode to an unrelated file —
+  # which the unique index on the pair would otherwise make permanently
+  # undetectable. A claim held by a path that is gone, or that now has a
+  # different identity, is stale.
+  #
+  # Two live paths sharing one inode are a hardlink of the same content, not a
+  # recycled inode, so that case stays known.
+  def stale_identity?(claim, candidate)
+    return false if claim.source_path == candidate.source_path
+
+    stat = File.lstat(claim.source_path)
+    [ stat.dev, stat.ino ] != [ candidate.device, candidate.inode ]
+  rescue SystemCallError
+    true
+  end
+
+  # Drop the stale claim so the new occupant of the inode can be recorded under
+  # it. Written with update_columns: this is index bookkeeping, not a change to
+  # the detection worth broadcasting to the review screens.
+  def release_identity!(claim)
+    claim.update_columns(source_device: nil, source_inode: nil, updated_at: Time.current)
+  rescue => e
+    Rails.logger.warn "[WatchedFolderScanService] Could not release stale source identity (#{e.class})"
   end
 
   # --- Path validation -----------------------------------------------------

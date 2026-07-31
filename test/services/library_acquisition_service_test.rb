@@ -145,7 +145,7 @@ class LibraryAcquisitionServiceTest < ActiveSupport::TestCase
     assert_not book.reload.acquired?, "but it is un-acquired so it can be re-imported"
   end
 
-  test "undo_import! refuses to delete a file outside the library output root" do
+  test "undo_import! refuses to guess when the import has no publication record" do
     outside = File.join(@source_dir, "not-in-library.epub")
     File.write(outside, "dummy")
     book = Book.create!(title: "Rogue", book_type: :ebook, file_path: outside)
@@ -158,8 +158,133 @@ class LibraryAcquisitionServiceTest < ActiveSupport::TestCase
     assert_raises LibraryAcquisitionService::AcquisitionConflictError do
       LibraryAcquisitionService.undo_import!(detection)
     end
-    assert File.exist?(outside), "a path outside the library is never removed"
+    assert File.exist?(outside), "nothing is removed without a record of what was published"
     assert_equal "imported", detection.reload.status
+  end
+
+  test "import! in move mode consumes a whole source directory" do
+    set_setting("completed_download_import_mode", "move")
+    release = File.join(@source_dir, "Warbreaker")
+    FileUtils.mkdir_p(release)
+    File.write(File.join(release, "01 - Chapter One.mp3"), "chapter one bytes")
+    File.write(File.join(release, "02 - Chapter Two.mp3"), "chapter two bytes")
+
+    book = Book.create!(title: "Warbreaker", author: "Brandon Sanderson", book_type: :audiobook)
+    detection = DetectedImport.create!(source_path: release, status: "importing", book_type: "audiobook")
+
+    result = LibraryAcquisitionService.import!(
+      source_path: release, book: book, owner: detection, mode: "move"
+    )
+
+    assert File.exist?(File.join(result.destination_path, "01 - Chapter One.mp3"))
+    assert File.exist?(File.join(result.destination_path, "02 - Chapter Two.mp3")),
+      "every file in the release is imported, not just the first"
+    assert_not File.exist?(release), "move consumes the source directory once the tree is published"
+    assert_equal 2, result.publication["files"].size
+  end
+
+  test "import! refuses a multi-file release when the output has no path template" do
+    set_setting("audiobook_path_template", "")
+    release = File.join(@source_dir, "Warbreaker")
+    FileUtils.mkdir_p(release)
+    File.write(File.join(release, "01 - Chapter One.mp3"), "chapter one bytes")
+    File.write(File.join(release, "02 - Chapter Two.mp3"), "chapter two bytes")
+    book = Book.create!(title: "Warbreaker", author: "Brandon Sanderson", book_type: :audiobook)
+    detection = DetectedImport.create!(source_path: release, status: "importing", book_type: "audiobook")
+
+    assert_raises LibraryFileImporter::FlatOutputUnsupportedError do
+      LibraryAcquisitionService.import!(
+        source_path: release, book: book, owner: detection, mode: "copy"
+      )
+    end
+
+    assert_empty Dir.glob(File.join(@audiobook_dest, "*")),
+      "the tracks are never scattered loose into the output root"
+    assert_nil book.reload.file_path, "and the book never claims the root as its path"
+    assert File.exist?(File.join(release, "01 - Chapter One.mp3")), "the source is untouched"
+  end
+
+  test "import! reverses the publication when the database claim is lost" do
+    set_setting("completed_download_import_mode", "move")
+    source = File.join(@source_dir, "Brandon Sanderson - Elantris.epub")
+    File.write(source, "dummy epub bytes")
+    book = Book.create!(title: "Elantris", author: "Brandon Sanderson", book_type: :ebook)
+    detection = DetectedImport.create!(source_path: source, status: "importing", book_type: "ebook")
+
+    conflict = lambda do |*|
+      raise LibraryAcquisitionService::AcquisitionConflictError, "claimed by another process"
+    end
+
+    assert_raises LibraryAcquisitionService::AcquisitionConflictError do
+      LibraryAcquisitionService.stub(:claim_file_path!, conflict) do
+        LibraryAcquisitionService.import!(
+          source_path: source, book: book, owner: detection, mode: "move"
+        )
+      end
+    end
+
+    assert File.exist?(source), "a lost claim returns the moved source to the watched folder"
+    assert_empty Dir.glob(File.join(@ebook_dest, "**", "*.epub")),
+      "no unclaimed artifact is left behind in the library"
+    assert_nil book.reload.file_path
+    assert_not book.acquired?
+    assert_nil detection.reload.publication_record
+  end
+
+  test "undo_import! leaves pre-existing files in a shared destination directory" do
+    release = File.join(@source_dir, "Warbreaker")
+    FileUtils.mkdir_p(release)
+    File.write(File.join(release, "01 - Chapter One.mp3"), "chapter one bytes")
+
+    book = Book.create!(title: "Warbreaker", author: "Brandon Sanderson", book_type: :audiobook)
+    detection = DetectedImport.create!(source_path: release, status: "importing", book_type: "audiobook")
+    result = LibraryAcquisitionService.import!(
+      source_path: release, book: book, owner: detection, mode: "copy"
+    )
+    detection.update!(status: "imported", imported_book: result.book, suggested_book: result.book)
+
+    bystander = File.join(result.destination_path, "preexisting.txt")
+    File.write(bystander, "not ours")
+
+    LibraryAcquisitionService.undo_import!(detection)
+
+    assert File.exist?(bystander), "undo never deletes files this import did not publish"
+    assert_not File.exist?(File.join(result.destination_path, "01 - Chapter One.mp3")),
+      "the imported file itself is removed"
+    assert File.directory?(result.destination_path),
+      "a destination directory that still holds other files is kept"
+  end
+
+  test "undo_import! will not delete outside the library through a swapped ancestor symlink" do
+    source = File.join(@source_dir, "Brandon Sanderson - Elantris.epub")
+    File.write(source, "dummy epub bytes")
+    book = Book.create!(title: "Elantris", author: "Brandon Sanderson", book_type: :ebook)
+    detection = DetectedImport.create!(source_path: source, status: "importing", book_type: "ebook")
+    result = LibraryAcquisitionService.import!(
+      source_path: source, book: book, owner: detection, mode: "copy"
+    )
+    detection.update!(status: "imported", imported_book: result.book, suggested_book: result.book)
+
+    outside = Dir.mktmpdir("laq-outside")
+    victim = File.join(outside, "Elantris", "victim.txt")
+    FileUtils.mkdir_p(File.dirname(victim))
+    File.write(victim, "unrelated data")
+
+    author_dir = File.join(@ebook_dest, "Brandon Sanderson")
+    FileUtils.rm_rf(author_dir)
+    File.symlink(outside, author_dir)
+
+    assert_raises LibraryAcquisitionService::AcquisitionConflictError do
+      LibraryAcquisitionService.undo_import!(detection)
+    end
+
+    assert File.exist?(victim), "removal resolves through pinned no-follow descriptors, not a pathname"
+    assert_equal "imported", detection.reload.status,
+      "a reversal that could not reach the published file leaves the detection imported"
+    assert book.reload.acquired?, "and leaves the book acquired rather than stranding the artifact"
+    assert detection.publication_record.present?, "the record is kept so undo can be retried"
+  ensure
+    FileUtils.rm_rf(outside) if outside
   end
 
   test "search_candidates maps provider results into scored online candidates" do

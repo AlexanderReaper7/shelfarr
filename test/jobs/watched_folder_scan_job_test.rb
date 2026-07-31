@@ -35,6 +35,21 @@ class WatchedFolderScanJobTest < ActiveJob::TestCase
     end
   end
 
+  test "a run still marked running past the concurrency lease is reported as failed" do
+    with_memory_cache do
+      WatchedFolderScanJob.mark_running!
+      Rails.cache.write(
+        WatchedFolderScanJob::STATUS_CACHE_KEY,
+        { state: "running", started_at: (WatchedFolderScanJob::RUNNING_STATUS_TTL + 1.minute).ago }
+      )
+
+      status = WatchedFolderScanJob.scan_status
+      assert_equal "idle", status[:state], "so the queue offers Scan now again"
+      assert status[:failed]
+      assert_not WatchedFolderScanJob.scanning_now?
+    end
+  end
+
   test "a failed scan is recorded as failed" do
     with_memory_cache do
       WatchedFolderScanJob.mark_completed!(nil)

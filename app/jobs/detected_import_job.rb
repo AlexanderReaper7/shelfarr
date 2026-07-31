@@ -19,7 +19,8 @@ class DetectedImportJob < ApplicationJob
         source_path: detected_import.source_path,
         book: book,
         owner: detected_import,
-        provenance: :watched_folder
+        provenance: :watched_folder,
+        source_identity: detected_import.source_identity
       )
 
       detected_import.update!(
