@@ -609,6 +609,12 @@ module DownloadClients
       params[:urls] = urls if urls.present?
       params[:category] = config.category if config.category.present?
       params[:savepath] = options[:save_path] if options[:save_path].present?
+      # Without autoTMM the category is only a label: qBittorrent saves to its
+      # global default path, which is usually not mounted into this container.
+      # An explicit savepath wins over the category, so only force it otherwise.
+      if config.category.present? && options[:save_path].blank?
+        params[:autoTMM] = "true"
+      end
       params[:paused] = options[:paused] ? "true" : "false" if options.key?(:paused)
       params.merge!(adapter_specific_add_torrent_params)
       params
