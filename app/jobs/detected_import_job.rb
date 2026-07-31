@@ -8,6 +8,20 @@
 class DetectedImportJob < ApplicationJob
   queue_as :default
 
+  # One import at a time per detection. The compare-and-swap below stops two
+  # workers claiming the same row, but a row wedged past STUCK_IMPORTING_AFTER is
+  # deliberately re-claimable — and without this lease a genuinely slow import
+  # would still be running when the admin recovers it, letting the second worker
+  # reverse what the first is finalizing. The lease serialises them instead.
+  #
+  # Its duration matches the stuck window on purpose: past that point the system
+  # treats the claiming worker as dead, so the lease must expire with it or a
+  # killed worker would block its own recovery for an hour.
+  limits_concurrency(
+    key: ->(detected_import_id) { "detected_import/#{detected_import_id}" },
+    duration: DetectedImport::STUCK_IMPORTING_AFTER
+  )
+
   def perform(detected_import_id)
     detected_import = claim(detected_import_id)
     return unless detected_import
@@ -46,17 +60,11 @@ class DetectedImportJob < ApplicationJob
 
   private
 
-  # Compare-and-swap detected/failed (or an abandoned, stale "importing" whose
-  # worker died before finishing) -> importing, so only one worker proceeds and
-  # a wedged row can be recovered.
+  # Compare-and-swap claimable -> importing, so only one worker proceeds while a
+  # wedged row stays recoverable.
   def claim(detected_import_id)
-    claimed = DetectedImport
+    claimed = DetectedImport.claimable
       .where(id: detected_import_id)
-      .where(
-        "status IN (:actionable) OR (status = 'importing' AND updated_at < :stuck_before)",
-        actionable: DetectedImport::ACTIONABLE_STATUSES,
-        stuck_before: DetectedImport::STUCK_IMPORTING_AFTER.ago
-      )
       .update_all(status: "importing", updated_at: Time.current)
     return unless claimed == 1
 

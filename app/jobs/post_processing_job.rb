@@ -477,43 +477,14 @@ class PostProcessingJob < ApplicationJob
     raise source_path_not_found_message(source_path)
   end
 
-  # The watched-folder scanner queues anything it finds under the library import
-  # path, which commonly includes the download client's completed folder. When it
-  # reaches a download before post-processing does, the same content sits in the
-  # review queue while this job imports it — and approving that row afterwards
-  # would import the title a second time. Retire those rows once the content is
-  # in the library.
-  #
-  # Matching runs in both directions because the two sides name a release
-  # differently. The client reports the file it downloaded, while the scanner
-  # records an audiobook release as its containing folder, so a detection is
-  # usually the parent of the file imported here. Enclosing folders are only
-  # ever one release — the scanner descends and emits separate detections when a
-  # folder holds several titles — so a detection above the imported source
-  # describes the same book.
+  # The watched-folder scanner queues anything under the library import path,
+  # which commonly includes the download client's completed folder. If it reaches
+  # a download before post-processing does, the same content sits in the review
+  # queue while this job imports it, and approving that row afterwards would
+  # import the title twice. Which rows to retire is the model's business (see
+  # DetectedImport.dismiss_for_imported_source!); this job just reports.
   def dismiss_detected_imports_for(source_path)
-    return if source_path.blank?
-
-    nested_pattern = "#{ActiveRecord::Base.sanitize_sql_like(source_path)}/%"
-    enclosing = enclosing_detection_paths(source_path)
-    dismissed = 0
-    DetectedImport.actionable
-      .where(
-        # SQLite's LIKE has no default escape character, so the backslashes
-        # sanitize_sql_like inserts are only inert with an explicit ESCAPE —
-        # without it a download path containing "_" would match nothing.
-        "source_path = :path OR source_path LIKE :nested ESCAPE '\\' OR source_path IN (:enclosing)",
-        path: source_path,
-        nested: nested_pattern,
-        enclosing: enclosing
-      )
-      .find_each do |detection|
-        # Saved one row at a time so the review screens receive the same
-        # Turbo refresh a manual dismissal broadcasts.
-        detection.update!(status: "dismissed")
-        dismissed += 1
-      end
-
+    dismissed = DetectedImport.dismiss_for_imported_source!(source_path)
     return if dismissed.zero?
 
     Rails.logger.info(
@@ -523,26 +494,6 @@ class PostProcessingJob < ApplicationJob
   rescue => e
     # Never fail a completed import over review-queue bookkeeping.
     Rails.logger.warn "[PostProcessingJob] Could not dismiss watched-folder detections (#{e.class})"
-  end
-
-  # Directories between the imported source and the watched-folder root, which
-  # are the only paths above it a detection can occupy. Bounded by that root so
-  # the walk can never reach a shared parent outside the scanned tree, and the
-  # root itself is excluded because the scanner never records it as a release.
-  def enclosing_detection_paths(source_path)
-    root = SettingsService.get(:library_import_path).to_s.strip.chomp("/")
-    return [] if root.blank?
-
-    paths = []
-    current = File.dirname(source_path)
-    while current.start_with?("#{root}/")
-      paths << current
-      parent = File.dirname(current)
-      break if parent == current
-
-      current = parent
-    end
-    paths
   end
 
   def cleanup_usenet_download(download)

@@ -374,6 +374,34 @@ class LibraryAcquisitionServiceTest < ActiveSupport::TestCase
     assert book.reload.acquired?
   end
 
+  test "import! reclaims a reservation stranded by a worker killed before the journal" do
+    source = File.join(@source_dir, "Brandon Sanderson - Elantris.epub")
+    File.write(source, "dummy epub bytes")
+    book = Book.create!(title: "Elantris", author: "Brandon Sanderson", book_type: :ebook)
+    detection = DetectedImport.create!(source_path: source, status: "importing", book_type: "ebook")
+
+    # A worker killed while copying bytes, before the journal write. Interrupt is
+    # not a StandardError, so import!'s rollback never runs and the reservation
+    # it took out is left behind with nothing to recover it.
+    assert_raises Interrupt do
+      LibraryAcquisitionService.stub(:record_publication!, ->(*) { raise Interrupt }) do
+        LibraryAcquisitionService.import!(
+          source_path: source, book: book, owner: detection, mode: "copy", source_base: @source_dir
+        )
+      end
+    end
+    assert book.reload.acquisition_blocked?, "the killed worker left its reservation behind"
+    assert_nil detection.reload.publication_record, "and no journal to recover from"
+
+    result = LibraryAcquisitionService.import!(
+      source_path: source, book: book, owner: detection, mode: "copy", source_base: @source_dir
+    )
+
+    assert book.reload.acquired?,
+      "the retry reclaims its own stranded reservation instead of failing for good"
+    assert File.exist?(result.destination_path)
+  end
+
   test "import! resumes an interrupted attempt that already claimed the book" do
     source = File.join(@source_dir, "Brandon Sanderson - Mistborn.epub")
     File.write(source, "dummy epub bytes")
@@ -483,9 +511,9 @@ class LibraryAcquisitionServiceTest < ActiveSupport::TestCase
 
   private
 
-  def set_setting(key, value)
+  def set_setting(key, value, type: "string", category: "import")
     Setting.find_or_create_by(key: key).update!(
-      value: value, value_type: "string", category: "paths"
+      value: value, value_type: type, category: category
     )
   end
 end

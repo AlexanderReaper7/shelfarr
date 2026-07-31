@@ -1,40 +1,46 @@
 # frozen_string_literal: true
 
 # Shared "identify a book and import a source file into the organised library"
-# engine used by any front door that adopts a file which was not acquired
-# through a Shelfarr request (currently the watched-folder importer).
+# engine for any front door adopting a file that was not acquired through a
+# Shelfarr request (currently the watched-folder importer).
 #
 # The request pipeline still uses UploadProcessingJob / PostProcessingJob
-# directly; this service reuses the same underlying identification and
-# path-template services so both paths agree on structure and matching.
+# directly; this service reuses the same identification and path-template
+# services, so both paths agree on structure and matching.
 #
-# +identify+ is read-only: it inspects a source file and returns a ranked
-# suggestion without creating any Book or touching the filesystem beyond
-# reading embedded metadata. +import!+ (see below) performs the actual,
-# crash-safe publication once an admin has approved a target Book.
+# +identify+ is read-only: a ranked suggestion, no Book created and no
+# filesystem writes. +import!+ performs the crash-safe publication once an admin
+# has approved a target Book.
 class LibraryAcquisitionService
-  # Audio container extensions that mark a file (or the folder containing it) as
-  # an audiobook. Distinct from Upload::AUDIOBOOK_EXTENSIONS, which also treats
-  # zip/rar archives as audiobook uploads — those are not present in a watched
-  # completed-download folder as playable media.
+  # Audio containers that mark a file (or its folder) as an audiobook. Unlike
+  # Upload::AUDIOBOOK_EXTENSIONS this excludes zip/rar archives, which are not
+  # playable media in a completed-download folder.
   AUDIO_EXTENSIONS = %w[m4a m4b mp3 aax aac flac ogg opus wav].freeze
   # Single-file readable formats (ebooks + comics), reused from the download
-  # importer so both front doors recognise the same file types.
+  # importer so both front doors recognise the same types.
   READABLE_EXTENSIONS = PostProcessingJob::EBOOK_FILE_EXTENSIONS
   MAX_ONLINE_CANDIDATES = 5
+  # Provider failures that are still a normal outcome: both candidate builders
+  # degrade to an empty list, since human review is the correctness backstop.
+  METADATA_ERRORS = [
+    HardcoverClient::Error,
+    GoogleBooksClient::Error,
+    OpenLibraryClient::Error,
+    MetadataService::Error
+  ].freeze
 
   class AcquisitionConflictError < StandardError; end
 
   # Outcome of a successful import into the organised library.
   ImportResult = Data.define(:book, :destination_path, :mode, :publication)
 
-  # What a retry found left behind by an interrupted attempt: either a result to
-  # hand straight back, or the source identity to import against once the
-  # stranded publication has been reversed.
+  # What a retry found from an interrupted attempt: either a result to hand
+  # straight back, or the source identity to import against once the stranded
+  # publication has been reversed.
   Recovery = Data.define(:result, :reversed, :source_identity)
 
-  # Read-only identification result. +candidate_books+ is a ranked array of
-  # plain hashes safe to persist as JSON on a DetectedImport.
+  # Read-only identification result. +candidate_books+ is a ranked array of plain
+  # hashes, safe to persist as JSON on a DetectedImport.
   Identification = Data.define(
     :book_type,
     :parsed_title,
@@ -48,13 +54,12 @@ class LibraryAcquisitionService
   class << self
     # Inspect a source file and return a ranked suggestion. No writes.
     #
-    # source_path   - a regular file to read embedded metadata from. For an
-    #                 audiobook folder the caller passes a representative audio
-    #                 file inside it.
+    # source_path   - regular file to read embedded metadata from; for an
+    #                 audiobook folder, a representative audio file inside it.
     # book_type     - optional override; inferred from the path when omitted.
-    # filename_hint - name used for the filename-parse fallback (defaults to the
-    #                 source basename; the caller passes the folder name for an
-    #                 audiobook so the parse reflects the release, not one track).
+    # filename_hint - name for the filename-parse fallback (defaults to the
+    #                 source basename; callers pass the folder name for an
+    #                 audiobook so the parse reflects the release, not a track).
     def identify(source_path:, book_type: nil, filename_hint: nil, online: true)
       resolved_type = (book_type || infer_book_type(source_path)).to_s
       extracted = MetadataExtractorService.extract(source_path)
@@ -94,36 +99,33 @@ class LibraryAcquisitionService
     def infer_book_type(source_path)
       return "audiobook" if File.directory?(source_path)
 
-      case File.extname(source_path.to_s).delete_prefix(".").downcase
+      case normalized_extension(source_path)
       when *Upload::COMICBOOK_EXTENSIONS then "comicbook"
       when *AUDIO_EXTENSIONS then "audiobook"
       else "ebook"
       end
     end
 
-    # Import an already-decided book's source file into the organised library,
-    # marking the book acquired and triggering a library scan.
+    # Import an already-decided book's source into the organised library, marking
+    # the book acquired and triggering a library scan.
     #
     # source_path - file or directory to publish.
-    # book        - the target Book (must not already be acquired/reserved).
-    # owner       - the record that owns the acquisition reservation for the
-    #               duration of the import (e.g. a DetectedImport). Required so
-    #               the reservation bridges the gap between the pre-import check
-    #               and the file_path claim, exactly like the upload path.
+    # book        - target Book (must not already be acquired/reserved).
+    # owner       - record holding the acquisition reservation for the duration
+    #               of the import (e.g. a DetectedImport). Required so the
+    #               reservation bridges the pre-import check and the file_path
+    #               claim, as the upload path does.
     # mode        - copy / move / hardlink; defaults to the configured
     #               completed_download_import_mode.
-    # source_identity - optional [device, inode] recorded when the source was
-    #               detected. The importer refuses to publish a source whose
-    #               inode no longer matches, so a path swapped between approval
-    #               and import cannot substitute different bytes.
-    # source_base - the root the source was found under (the watched folder),
-    #               recorded on the publication so undo can restore a moved file
-    #               through descriptors pinned to that root.
+    # source_identity - optional [device, inode] from detection. The importer
+    #               refuses a source whose inode no longer matches, so a path
+    #               swapped between approval and import cannot substitute bytes.
+    # source_base - the root the source was found under, recorded so undo can
+    #               restore a moved file through descriptors pinned to it.
     #
-    # The publication record is persisted on +owner+ before the database claim,
-    # so a crash or a lost claim race can still be reversed precisely: bytes are
-    # already on disk at that point and only an exact record of them makes the
-    # rollback safe.
+    # The publication record is persisted on +owner+ before the database claim:
+    # bytes are on disk by then, and only an exact record of them makes a crash
+    # or a lost claim race reversible.
     def import!(source_path:, book:, owner:, mode: nil, provenance: nil, source_identity: nil, source_base: nil)
       mode = (mode || SettingsService.get(:completed_download_import_mode, default: "copy")).to_s
       base_path = output_base_path(book)
@@ -162,11 +164,10 @@ class LibraryAcquisitionService
         )
       rescue
         # Anything short of a completed claim is reversed, including a tree
-        # import that failed partway through: the importer's record covers every
-        # file it managed to publish before raising. A reversal that could not
-        # finish is logged rather than raised — the original failure is the one
-        # worth reporting — and its record is left behind so the next attempt
-        # (or an undo) can retry the reversal.
+        # import that failed partway: the importer's record covers every file it
+        # published before raising. An incomplete reversal is logged rather than
+        # raised — the original failure is the one worth reporting — and its
+        # record is kept so the next attempt (or an undo) can retry.
         reversed = claimed || reverse_publication!(importer.publication_record, owner)
         unless reversed
           Rails.logger.error(
@@ -174,39 +175,37 @@ class LibraryAcquisitionService
               "some published files remain in the library"
           )
         end
-        # A reversed move put the source back on a fresh inode, so the identity
-        # recorded at detection would fail the next attempt's check.
+        # A reversed move puts the source back on a fresh inode, so the recorded
+        # identity would fail the next attempt's check.
         refresh_source_identity!(owner) if reversed && !claimed && mode == "move"
         release_reservation!(book, owner)
         raise
       end
     end
 
-    # Reverse a completed import so the detection returns to the review queue and
-    # can be re-imported against a different match (e.g. the admin approved "new
-    # book" by mistake when a real match existed).
+    # Reverse a completed import so the detection returns to the queue and can be
+    # re-imported against a different match (e.g. "new book" approved by mistake).
     #
-    # Copy / hardlink imports leave the watched-folder source in place, so undo
-    # simply discards the library artifact. A move import consumed the source, so
-    # undo returns the artifact to where the scanner found it. Either way the book
-    # is un-acquired, and a throwaway book created solely for this import (no
-    # metadata, no requests/uploads/owned items) is destroyed rather than left
-    # behind un-acquired.
+    # Copy / hardlink imports leave the source in place, so undo just discards the
+    # library artifact; a move consumed the source, so undo returns the artifact
+    # to where the scanner found it. Either way the book is un-acquired, and a
+    # throwaway book created solely for this import (no metadata, no
+    # requests/uploads/owned items) is destroyed rather than left behind.
     def undo_import!(detected_import)
       book = detected_import.imported_book
       publication = detected_import.publication_record
 
       if publication.present?
-        # Only a complete reversal earns the state reset below. A file that is
-        # no longer the one this import published (renamed, re-tagged, replaced)
-        # is left alone, and un-acquiring the book anyway would strand it in the
-        # library and let a re-import duplicate it.
+        # Only a complete reversal earns the state reset below. A file that is no
+        # longer the one this import published (renamed, re-tagged, replaced) is
+        # left alone; un-acquiring the book anyway would strand it in the library
+        # and let a re-import duplicate it.
         #
-        # The journal is deliberately not cleared here: it is the only durable
+        # The journal is deliberately not cleared here — it is the only durable
         # description of what this import put on disk, and the transaction below
-        # can still fail (or the process die) after the files have moved. It is
-        # cleared by that transaction, so until it commits a retried undo still
-        # has a record to work from — every step below is idempotent.
+        # can still fail after the files have moved. That transaction clears it,
+        # so a retried undo always has a record to work from and every step is
+        # idempotent.
         unless reverse_publication!(publication, detected_import, clear_record: false)
           raise AcquisitionConflictError,
             "Refusing to undo: the file this import published could not be returned or removed — it has been " \
@@ -214,10 +213,9 @@ class LibraryAcquisitionService
         end
         refresh_source_identity!(detected_import) if publication["mode"].to_s == "move"
       elsif book&.file_path.present?
-        # Without an exact record of what was published there is no safe way to
-        # tell this import's files apart from anything else living under the
-        # same templated directory, and guessing is how unrelated files get
-        # deleted. Leave the artifact and the detection alone for the admin.
+        # Without an exact record there is no safe way to tell this import's
+        # files from anything else under the same templated directory, and
+        # guessing is how unrelated files get deleted. Leave both to the admin.
         raise AcquisitionConflictError,
           "Refusing to undo: this import predates publication tracking, so #{book.file_path} " \
           "must be removed manually before it can be re-imported"
@@ -236,68 +234,69 @@ class LibraryAcquisitionService
     end
 
     def audio_file?(path)
-      AUDIO_EXTENSIONS.include?(File.extname(path.to_s).delete_prefix(".").downcase)
+      AUDIO_EXTENSIONS.include?(normalized_extension(path))
     end
 
     def readable_file?(path)
-      READABLE_EXTENSIONS.include?(File.extname(path.to_s).delete_prefix(".").downcase)
+      READABLE_EXTENSIONS.include?(normalized_extension(path))
     end
 
-    # Compute just the online alternate list for an already-parsed title/author.
-    # Used by deferred enrichment so the (networked) provider lookups run off the
-    # scan hot path, one queued job per detection, rather than thousands of
-    # sequential searches inside a single scan.
+    # Just the online alternates for an already-parsed title/author. Used by
+    # deferred enrichment so provider lookups run off the scan hot path, one
+    # queued job per detection.
     def online_candidates_for(title:, author:, book_type:)
       online_candidates(title, author, book_type.to_s)
     end
 
-    # Run a free-text metadata search for the manual "search for the correct
-    # book" step on the review page. Unlike +online_candidates+, results are
-    # scored against the admin's query (not the auto-parsed title) and no
-    # low-score filter is applied — the admin asked for exactly these, so every
-    # provider hit is offered as a selectable candidate in the usual hash shape.
+    # Free-text search for the review page's manual "find the correct book" step.
+    # Unlike +online_candidates+, results are scored against the admin's query
+    # and unfiltered — the admin asked for exactly these, so every hit is offered
+    # as a selectable candidate.
     def search_candidates(query:, book_type:, limit: MAX_ONLINE_CANDIDATES)
       query = query.to_s.strip
       return [] if query.blank?
 
-      content_kind = book_type.to_s == "comicbook" ? "graphic" : nil
-      results = MetadataService.search(query, limit: limit, content_kind: content_kind)
+      results = MetadataService.search(
+        query, limit: limit, content_kind: metadata_content_kind(book_type)
+      )
       normalized_query = query.downcase
       results.map do |result|
         haystack = [ result.title, result.author ].compact.join(" ").downcase
-        {
-          "kind" => "online",
-          "work_id" => result.work_id,
-          "title" => result.title,
-          "author" => result.author,
-          "year" => result.year,
-          "cover_url" => result.cover_url,
-          "source" => result.source,
-          "score" => string_similarity(haystack, normalized_query)
-        }
+        online_candidate(result, string_similarity(haystack, normalized_query))
       end.sort_by { |candidate| -candidate["score"] }
-    rescue HardcoverClient::Error, GoogleBooksClient::Error, OpenLibraryClient::Error, MetadataService::Error => e
+    rescue *METADATA_ERRORS => e
       Rails.logger.warn "[LibraryAcquisitionService] Manual search failed (#{e.class})"
       []
     end
 
     private
 
-    # An owner that already carries a publication record reached durable state on
-    # an earlier attempt: bytes are on disk and, for a move, the source is gone.
-    # Re-running the import from that source would read a path that no longer
-    # exists and fail, leaving the bytes, the journal, and the reservation
-    # stranded with no way to undo. So reconcile that phase first.
+    # An owner already carrying a publication record reached durable state on an
+    # earlier attempt: bytes are on disk and, for a move, the source is gone.
+    # Re-importing from that source would read a dead path and fail, stranding
+    # the bytes, journal, and reservation with no way to undo. Reconcile first.
     #
-    # If the earlier attempt also claimed the book, the import actually finished
-    # and only the caller's bookkeeping was lost — hand back its result rather
-    # than publishing a second copy. Otherwise reverse it, which returns a moved
-    # source to the watched folder, and import again from there.
+    # If that attempt also claimed the book, the import finished and only the
+    # bookkeeping was lost — hand back its result instead of publishing a second
+    # copy. Otherwise reverse it, returning a moved source to the watched folder,
+    # and import again from there.
     def recover_interrupted_publication!(owner, book, source_identity)
-      record = owner.respond_to?(:publication_record) ? owner.publication_record.presence : nil
-      return Recovery.new(result: nil, reversed: false, source_identity: nil) if record.blank?
-
+      record = journals_publication?(owner) ? owner.publication_record.presence : nil
       book.reload
+
+      if record.blank?
+        # An attempt killed between reserve_book! and the journal write left
+        # nothing to reverse — but its reservation outlives it, and nothing else
+        # clears one held by this owner (the upload and download recovery jobs
+        # only reclaim their own). Left in place it fails every retry with a
+        # conflict and blocks the book for the other pipelines too, permanently.
+        # Releasing it is safe for the same reason as in the branch below:
+        # release_reservation! only touches a reservation this owner still holds
+        # on an unclaimed book.
+        release_reservation!(book, owner)
+        return Recovery.new(result: nil, reversed: false, source_identity: nil)
+      end
+
       if publication_claimed_by?(record, book)
         Rails.logger.info(
           "[LibraryAcquisitionService] Resuming interrupted import for book ##{book.id}; the library file is already claimed"
@@ -317,8 +316,6 @@ class LibraryAcquisitionService
       end
 
       # The dead attempt's reservation would otherwise block reserve_book!.
-      # release_reservation! only touches a reservation still held by this owner
-      # on an unclaimed book, which is exactly the interrupted case.
       release_reservation!(book, owner)
       unless reverse_publication!(record, owner)
         raise AcquisitionConflictError,
@@ -326,10 +323,9 @@ class LibraryAcquisitionService
           "Resolve them under #{record['base_path']} and try again."
       end
 
-      # A reversed move put the source back on a fresh inode (the restore is a
-      # durable copy plus an unlink, not a rename), so the identity the caller
-      # is about to import against has to be re-read. A copy or hardlink never
-      # touched the source, so its recorded identity still stands.
+      # A reversed move puts the source back on a fresh inode (the restore is a
+      # durable copy plus unlink, not a rename), so the identity must be re-read.
+      # Copy and hardlink never touched the source, so theirs still stands.
       identity = record["mode"].to_s == "move" ? refresh_source_identity!(owner) : source_identity
       Rails.logger.warn(
         "[LibraryAcquisitionService] Reversed an interrupted import for book ##{book.id} before retrying"
@@ -337,8 +333,8 @@ class LibraryAcquisitionService
       Recovery.new(result: nil, reversed: true, source_identity: identity)
     end
 
-    # Whether the book's claimed file_path is what this publication produced —
-    # the file it published, or the per-book directory it published into.
+    # Whether the book's claimed file_path is what this publication produced: the
+    # file it published, or the per-book directory it published into.
     def publication_claimed_by?(record, book)
       claimed = book.file_path.presence
       return false if claimed.blank?
@@ -350,9 +346,9 @@ class LibraryAcquisitionService
         destinations.all? { |destination| destination.start_with?(File.join(claimed, "")) }
     end
 
-    # Reserve the book under a row lock so a concurrent acquisition (upload or
-    # download) cannot claim the same title while the file import runs outside
-    # the transaction. Raises if the title is already acquired or reserved.
+    # Reserve the book under a row lock so a concurrent upload or download cannot
+    # claim the same title while the import runs outside the transaction. Raises
+    # if the title is already acquired or reserved.
     def reserve_book!(book, owner)
       ActiveRecord::Base.transaction do
         book.lock!
@@ -373,18 +369,9 @@ class LibraryAcquisitionService
     # Attach the imported path and clear the reservation in one compare-and-swap
     # so only the worker still holding this owner's reservation can finalize.
     def claim_file_path!(book, destination, owner)
-      claimed = Book.where(id: book.id)
-        .where("file_path IS NULL OR TRIM(file_path) = ''")
-        .where(
-          acquisition_reservation_owner_type: owner.class.name,
-          acquisition_reservation_owner_id: owner.id
-        )
+      claimed = Book.where(id: book.id).unclaimed.reserved_by(owner)
         .update_all(
-          file_path: destination,
-          acquisition_reservation_token: nil,
-          acquisition_reservation_owner_type: nil,
-          acquisition_reservation_owner_id: nil,
-          updated_at: Time.current
+          Book::RESERVATION_CLEARED.merge(file_path: destination, updated_at: Time.current)
         )
       raise AcquisitionConflictError, "This title was acquired by another process during import" unless claimed == 1
 
@@ -392,60 +379,62 @@ class LibraryAcquisitionService
     end
 
     def release_reservation!(book, owner)
-      Book.where(id: book.id)
-        .where(
-          acquisition_reservation_owner_type: owner.class.name,
-          acquisition_reservation_owner_id: owner.id
-        )
-        .where("file_path IS NULL OR TRIM(file_path) = ''")
-        .update_all(
-          acquisition_reservation_token: nil,
-          acquisition_reservation_owner_type: nil,
-          acquisition_reservation_owner_id: nil,
-          updated_at: Time.current
-        )
+      Book.where(id: book.id).unclaimed.reserved_by(owner)
+        .update_all(Book::RESERVATION_CLEARED.merge(updated_at: Time.current))
     rescue => e
       Rails.logger.error "[LibraryAcquisitionService] Failed to release reservation for book ##{book.id} (#{e.class})"
     end
 
-    # Persist what an import published so a later rollback or undo can reverse
-    # exactly those entries. Written with update_columns so an in-flight import
-    # neither runs validations nor broadcasts a status change.
+    # Persist what an import published so a rollback or undo can reverse exactly
+    # those entries. update_columns so an in-flight import neither validates nor
+    # broadcasts a status change.
     #
-    # A failure here is fatal on purpose. The bytes are already on disk and a
-    # move has already consumed the source, so this write is the only durable
-    # thing that can reverse them; committing the import without it would leave
-    # an acquired book whose undo has nothing to work from. Raising instead
-    # sends the caller into the rollback below, which reverses the in-memory
-    # record while it is still available.
+    # A failure here is fatal on purpose: bytes are on disk and a move has
+    # consumed the source, so this write is the only durable thing that can
+    # reverse them. Committing without it would leave an acquired book whose undo
+    # has nothing to work from; raising instead sends the caller into the
+    # rollback, which reverses the in-memory record while it is still available.
     def record_publication!(owner, publication)
-      return unless owner.respond_to?(:publication_record=) && owner.persisted?
+      return unless journals_publication?(owner)
 
       owner.update_columns(publication_record: publication, updated_at: Time.current)
     end
 
+    # Whether +owner+ can carry this import's publication journal. Asked rather
+    # than assumed (the service accepts any record), and asked in one place so
+    # the read and the two writes agree on what counts as journalled.
+    def journals_publication?(owner)
+      owner.respond_to?(:publication_record=) && owner.persisted?
+    end
+
+    # Comics are searched against a different provider corpus than prose.
+    def metadata_content_kind(book_type)
+      book_type.to_s == "comicbook" ? "graphic" : nil
+    end
+
+    def normalized_extension(path)
+      File.extname(path.to_s).delete_prefix(".").downcase
+    end
+
     # Reverse exactly the entries this import published: discard the files it
-    # created (or, for a move, return them to where the scanner found them) and
-    # then drop only the directories it brought into existence, and only while
-    # they are still empty. A templated "Author/Book" directory is routinely
-    # shared with files this import does not own, so it is never deleted
-    # recursively.
+    # created (or, for a move, return them to where the scanner found them), then
+    # drop only the directories it brought into existence, and only while they
+    # are still empty. A templated "Author/Book" directory is routinely shared
+    # with files this import does not own, so it is never deleted recursively.
     #
-    # Containment is structural rather than a pathname comparison: every removal
-    # walks from the output root through pinned O_NOFOLLOW descriptors and is
-    # gated on the (device, inode) recorded at publication, so neither an
-    # ancestor swapped for a symlink nor a root that canonicalizes differently
-    # (/var vs /private/var) can redirect or block it.
+    # Containment is structural, not a pathname comparison: every removal walks
+    # from the output root through pinned O_NOFOLLOW descriptors, gated on the
+    # (device, inode) recorded at publication. Neither an ancestor swapped for a
+    # symlink nor a root that canonicalizes differently can redirect it.
     #
     # Returns true only when every recorded file was reversed. A caller that
-    # resets state on the strength of the reversal must not proceed on false:
-    # the library still holds an artifact this import put there. The record is
-    # kept in that case so undo can be retried once the admin has resolved it;
-    # every step is idempotent, so a retry re-reverses only what is left.
+    # resets state on the reversal must not proceed on false — the library still
+    # holds an artifact this import put there. The record is kept so undo can be
+    # retried; every step is idempotent, so a retry reverses only what is left.
     #
-    # +clear_record+ drops the journal once the reversal is complete. Callers
-    # that still have durable state to commit afterwards pass false and clear it
-    # themselves, so a failure in that window leaves a record to retry from.
+    # +clear_record+ drops the journal once complete. Callers with durable state
+    # still to commit pass false and clear it themselves, so a failure in that
+    # window leaves a record to retry from.
     def reverse_publication!(publication, owner, clear_record: true)
       publication = publication.presence || {}
       files = Array(publication["files"])
@@ -464,16 +453,16 @@ class LibraryAcquisitionService
     end
 
     def clear_publication_record!(owner)
-      return unless owner.respond_to?(:publication_record=) && owner.persisted?
+      return unless journals_publication?(owner)
 
       owner.update_columns(publication_record: nil, updated_at: Time.current)
     rescue => e
       Rails.logger.warn("[LibraryAcquisitionService] Failed to clear publication record (#{e.class})")
     end
 
-    # Copy or hardlink: the watched-folder source is still present, so the
-    # library artifact is a redundant second copy — discard it. Returns true
-    # when the entry is reversed, which includes finding it already gone.
+    # Copy or hardlink: the source is still present, so the library artifact is a
+    # redundant second copy — discard it. True when reversed, including when it
+    # was already gone.
     def discard_published_file!(entry, root)
       destination = entry["destination"].presence
       return true if destination.blank?
@@ -499,18 +488,16 @@ class LibraryAcquisitionService
     end
 
     # Move: the source is gone, so return this file to the path the scanner
-    # recorded for it. Restoring per file rebuilds a moved directory tree
-    # exactly as it was found. Returns true when the entry is reversed.
+    # recorded. Restoring per file rebuilds a moved tree exactly as it was found.
     def restore_moved_file!(entry, root, source_base)
       destination = entry["destination"].presence
       source = entry["source"].presence
       return true if destination.blank? || source.blank?
 
       # The library artifact decides what is left to do. Gone means this entry
-      # was already reversed (a retried undo, or a restore that completed), and
-      # a mismatch means something else now owns the path and must not be
-      # touched — neither case may consult the source, whose path can since have
-      # been taken over by unrelated bytes.
+      # was already reversed; a mismatch means something else owns the path now.
+      # Neither may consult the source, whose path may since have been taken over
+      # by unrelated bytes.
       case published_file_state(entry, root)
       when :absent then return true
       when :mismatch
@@ -524,15 +511,14 @@ class LibraryAcquisitionService
       case moved_source_state(entry)
       when :absent then restore_to_source!(entry, root, source_base)
       when :match
-        # A directory move publishes every file before unlinking the source
-        # tree, so a reversal partway through finds the original source still in
-        # place. The library copy is then redundant rather than the only
-        # surviving one.
+        # A directory move publishes every file before unlinking the source tree,
+        # so a partway reversal finds the original still in place — the library
+        # copy is redundant rather than the only survivor.
         discard_published_file!(entry, root)
       else
-        # Something occupies the source path that is not what this import took
-        # from it. Removing the library copy would destroy the only surviving
-        # bytes, and overwriting the occupant would destroy someone else's.
+        # Something occupies the source path that this import did not take from
+        # it. Removing the library copy would destroy the only surviving bytes;
+        # overwriting the occupant would destroy someone else's.
         Rails.logger.warn(
           "[LibraryAcquisitionService] Left #{destination} in the library during undo: " \
             "#{source} is occupied by a different file"
@@ -541,12 +527,11 @@ class LibraryAcquisitionService
       end
     end
 
-    # Return the library artifact to the path the scanner recorded, rebuilding
-    # any parent directories the move left empty. Both the mkdir and the
-    # publication walk from the watched-folder root through pinned O_NOFOLLOW
-    # descriptors, so a source ancestor swapped for a symlink since the import
-    # cannot redirect the restore outside the watched folder. Without a recorded
-    # root there is nothing safe to pin against, so the restore is refused.
+    # Return the artifact to the path the scanner recorded, rebuilding any parent
+    # directories the move left empty. Both the mkdir and the publication walk
+    # from the watched-folder root through pinned O_NOFOLLOW descriptors, so an
+    # ancestor swapped for a symlink cannot redirect the restore outside it.
+    # Without a recorded root there is nothing safe to pin against, so refuse.
     def restore_to_source!(entry, root, source_base)
       destination = entry["destination"]
       source = entry["source"]
@@ -572,28 +557,20 @@ class LibraryAcquisitionService
     end
 
     # Whether the source path still holds the file this import moved out of it.
-    # An import that recorded no source identity cannot prove it either way, so
-    # an occupied path counts as a mismatch rather than an assumed match.
-    #
-    #   :absent    - the move consumed it and nothing has taken the path since
-    #   :match     - the original file is still there (a partly-reversed move)
-    #   :mismatch  - a different file now occupies the path
+    # :absent means the move consumed it and nothing has taken the path since;
+    # :match that the original is still there (a partly-reversed move). An import
+    # with no recorded identity cannot prove it either way, and
+    # path_identity_state reports that as :mismatch — left alone, not assumed
+    # ours.
     def moved_source_state(entry)
-      stat = File.lstat(entry["source"])
-      device = entry["source_device"]
-      inode = entry["source_inode"]
-      return :mismatch if device.blank? || inode.blank?
-
-      [ stat.dev, stat.ino ] == [ device, inode ] ? :match : :mismatch
-    rescue Errno::ENOENT, Errno::ENOTDIR
-      :absent
-    rescue SystemCallError
-      :mismatch
+      FileCopyService.path_identity_state(
+        entry["source"], device: entry["source_device"], inode: entry["source_inode"]
+      )
     end
 
-    # Drop a directory this import created, but only while it is still exactly
-    # as empty as it was left. remove_directory_child_if_identity quarantines it
-    # and restores it untouched when anything has since been written into it.
+    # Drop a directory this import created, but only while still exactly as empty
+    # as it was left. remove_directory_child_if_identity quarantines it and
+    # restores it untouched if anything has since been written into it.
     def discard_created_directory!(entry, root)
       path = entry["path"].presence
       device = entry["device"]
@@ -616,9 +593,9 @@ class LibraryAcquisitionService
     # listed through descriptors pinned to the output root rather than resolved
     # from the pathname.
     #
-    #   :match     - the published file is still there, byte for byte the same
-    #   :absent    - already gone, so there is nothing left to reverse
-    #   :mismatch  - something else now occupies the path; never touch it
+    #   :match     - still there, byte for byte the same
+    #   :absent    - already gone, nothing left to reverse
+    #   :mismatch  - something else occupies the path; never touch it
     def published_file_state(entry, root)
       device = entry["device"]
       inode = entry["inode"]
@@ -637,12 +614,10 @@ class LibraryAcquisitionService
       :mismatch
     end
 
-    # A move import that has been undone put the source back with a fresh inode
-    # (the restore is a durable copy followed by an unlink, not a rename), so
-    # the identity recorded at detection no longer describes it. Re-record it,
-    # or drop it when it cannot be read — the importer treats a missing identity
-    # as "unverifiable" rather than refusing the re-import outright. Returns the
-    # identity now recorded, or nil when it could not be read.
+    # An undone move put the source back with a fresh inode (a durable copy plus
+    # unlink, not a rename), so the identity recorded at detection no longer
+    # describes it. Re-record it, or drop it when unreadable — the importer
+    # treats a missing identity as unverifiable rather than refusing outright.
     def refresh_source_identity!(detected_import)
       return nil unless detected_import.respond_to?(:source_device=)
 
@@ -652,7 +627,7 @@ class LibraryAcquisitionService
       )
       [ stat.dev, stat.ino ]
     rescue => e
-      # Never raise: this also runs while unwinding a failed import, where the
+      # Never raise: this also runs while unwinding a failed import, whose
       # original error is the one worth reporting.
       Rails.logger.warn("[LibraryAcquisitionService] Clearing source identity after undo (#{e.class})")
       begin
@@ -663,17 +638,12 @@ class LibraryAcquisitionService
       nil
     end
 
-    # Un-acquire the book and destroy it when it was a throwaway created solely
-    # for this import (no metadata identity and nothing else references it). A
+    # Un-acquire the book, destroying it when it was a throwaway created solely
+    # for this import (no metadata identity, nothing else referencing it). A
     # matched or metadata-bearing book is kept, merely un-acquired.
     def release_book_after_undo!(book)
       book.reload
-      book.update!(
-        file_path: nil,
-        acquisition_reservation_token: nil,
-        acquisition_reservation_owner_type: nil,
-        acquisition_reservation_owner_id: nil
-      )
+      book.update!(Book::RESERVATION_CLEARED.merge(file_path: nil))
 
       if book.unified_work_id.blank? &&
           book.requests.none? && book.uploads.none? && book.owned_library_items.none?
@@ -681,14 +651,11 @@ class LibraryAcquisitionService
       end
     end
 
+    # Resolved by PathTemplateService rather than restated: this root is handed
+    # to LibraryFileImporter, which renders the path template beneath it, so the
+    # two must agree on where a book type lives.
     def output_base_path(book)
-      if book.comicbook?
-        SettingsService.get(:comicbook_output_path, default: "/comics")
-      elsif book.ebook?
-        SettingsService.get(:ebook_output_path, default: "/ebooks")
-      else
-        SettingsService.get(:audiobook_output_path, default: "/audiobooks")
-      end
+      PathTemplateService.output_root_for(book)
     end
 
     def trigger_library_scan(book)
@@ -703,6 +670,22 @@ class LibraryAcquisitionService
       Rails.logger.warn "[LibraryAcquisitionService] Failed to trigger library scan (#{e.class})"
     end
 
+    # The persisted shape of one provider hit. Automatic enrichment and the
+    # admin's manual search both offer candidates through this hash; only the
+    # score differs, since they rank against different queries.
+    def online_candidate(result, score)
+      {
+        "kind" => "online",
+        "work_id" => result.work_id,
+        "title" => result.title,
+        "author" => result.author,
+        "year" => result.year,
+        "cover_url" => result.cover_url,
+        "source" => result.source,
+        "score" => score
+      }
+    end
+
     def library_candidate(book, score)
       {
         "kind" => "library",
@@ -713,30 +696,21 @@ class LibraryAcquisitionService
       }
     end
 
-    # Best-effort online enrichment. Network/parse failures degrade to an empty
-    # alternate list — the human review step is the correctness backstop.
+    # Best-effort online enrichment; failures degrade to an empty alternate list.
     def online_candidates(title, author, book_type)
       return [] if title.blank?
 
       query = author.present? ? "#{title} #{author}" : title
-      content_kind = book_type.to_s == "comicbook" ? "graphic" : nil
-      results = MetadataService.search(query, limit: MAX_ONLINE_CANDIDATES, content_kind: content_kind)
+      results = MetadataService.search(
+        query, limit: MAX_ONLINE_CANDIDATES, content_kind: metadata_content_kind(book_type)
+      )
       results.filter_map do |result|
         score = online_score(result, title, author)
         next if score < 30
 
-        {
-          "kind" => "online",
-          "work_id" => result.work_id,
-          "title" => result.title,
-          "author" => result.author,
-          "year" => result.year,
-          "cover_url" => result.cover_url,
-          "source" => result.source,
-          "score" => score
-        }
+        online_candidate(result, score)
       end.sort_by { |candidate| -candidate["score"] }
-    rescue HardcoverClient::Error, GoogleBooksClient::Error, OpenLibraryClient::Error, MetadataService::Error => e
+    rescue *METADATA_ERRORS => e
       Rails.logger.warn "[LibraryAcquisitionService] Metadata search failed (#{e.class})"
       []
     end

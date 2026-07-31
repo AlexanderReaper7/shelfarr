@@ -1,12 +1,10 @@
 # frozen_string_literal: true
 
-# Fills in a fresh detection's online alternate matches out-of-band, so the
-# watched-folder scan stays local + DB only and never blocks on thousands of
-# sequential provider searches. Non-destructive: it only appends online
-# candidates the scan didn't already record, and leaves the parsed metadata and
-# the local library suggestion untouched. Network/parse failures are swallowed —
-# the admin review step (and the manual Re-match) remain the correctness
-# backstop.
+# Fills in a detection's online alternates out-of-band, so the watched-folder
+# scan stays local + DB only and never blocks on thousands of sequential provider
+# searches. Non-destructive: it appends candidates the scan didn't record and
+# leaves the parsed metadata and library suggestion alone. Failures are swallowed
+# — admin review and the manual Re-match are the correctness backstop.
 class DetectedImportEnrichmentJob < ApplicationJob
   queue_as :default
 

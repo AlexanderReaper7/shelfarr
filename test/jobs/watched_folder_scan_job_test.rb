@@ -62,9 +62,9 @@ class WatchedFolderScanJobTest < ActiveJob::TestCase
   test "a manual scan records its completion" do
     watched = Dir.mktmpdir("wfsj-watched")
     audiobook_dest = Dir.mktmpdir("wfsj-audiobooks")
-    set_setting("audiobook_output_path", audiobook_dest, "paths")
-    set_setting("library_import_enabled", "true", "import", "boolean")
-    set_setting("library_import_path", watched, "import")
+    set_setting("audiobook_output_path", audiobook_dest, category: "paths")
+    set_setting("library_import_enabled", "true", type: "boolean")
+    set_setting("library_import_path", watched)
     File.write(File.join(watched, "Some Author - A Book.epub"), "dummy epub")
 
     with_memory_cache do
@@ -79,11 +79,31 @@ class WatchedFolderScanJobTest < ActiveJob::TestCase
     [ watched, audiobook_dest ].each { |dir| FileUtils.rm_rf(dir) if dir }
   end
 
+  test "a failing scan still reports completion and re-arms the chain" do
+    watched = Dir.mktmpdir("wfsj-failing")
+    set_setting("library_import_enabled", "true", type: "boolean")
+    set_setting("library_import_path", watched)
+
+    with_memory_cache do
+      assert_enqueued_with(job: WatchedFolderScanJob) do
+        WatchedFolderScanService.stub(:scan!, ->(*) { raise "boom" }) do
+          WatchedFolderScanJob.new.perform(manual: true)
+        end
+      end
+
+      status = WatchedFolderScanJob.scan_status
+      assert_equal "idle", status[:state], "a crashed scan must not leave Scan now disabled"
+      assert status[:failed]
+    end
+  ensure
+    FileUtils.rm_rf(watched) if watched
+  end
+
   private
 
-  def set_setting(key, value, category = "paths", value_type = "string")
+  def set_setting(key, value, type: "string", category: "import")
     Setting.find_or_create_by(key: key).update!(
-      value: value, value_type: value_type, category: category
+      value: value, value_type: type, category: category
     )
   end
 end

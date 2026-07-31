@@ -2,14 +2,13 @@
 
 module Admin
   class DetectedImportsController < BaseController
-    # Raised when the admin picked a specific candidate that can no longer be
-    # resolved to a book, so import fails loudly instead of silently importing a
-    # different target.
+    # Raised when a picked candidate can no longer be resolved to a book, so the
+    # import fails loudly instead of silently importing a different target.
     class SelectionError < StandardError; end
 
-    # How many imported items the history section shows before the admin expands
-    # it. The full history is only queried when expanded, so the common (collapsed)
-    # render stays cheap and the dismissed section below remains within reach.
+    # How many imported items the history shows before the admin expands it. The
+    # full history is only queried when expanded, so the collapsed render stays
+    # cheap and the dismissed section stays within reach.
     IMPORTED_PREVIEW_COUNT = 10
 
     before_action :set_detected_import, only: [ :show, :destroy, :import, :dismiss, :restore, :rematch, :search, :undo ]
@@ -30,14 +29,22 @@ module Admin
     def show
     end
 
-    # Manually trigger a watched-folder scan (in addition to the recurring one).
+    # Manually trigger a watched-folder scan, in addition to the recurring one.
+    #
+    # A scan in flight holds the job's concurrency key, declared
+    # on_conflict: :discard, so a manual scan enqueued now would be thrown away.
+    # Say so rather than claiming a scan started — the running one is about to
+    # report what it found anyway.
     def scan
-      if WatchedFolderScanJob.scanning_enabled?
-        WatchedFolderScanJob.perform_later(manual: true)
-        redirect_to admin_detected_imports_path, notice: "Watched-folder scan started."
-      else
+      if !WatchedFolderScanJob.scanning_enabled?
         redirect_to admin_detected_imports_path,
           alert: "Enable watched-folder import and set a path in Settings first."
+      elsif WatchedFolderScanJob.scanning_now?
+        redirect_to admin_detected_imports_path,
+          notice: "A watched-folder scan is already running. Its results will appear here when it finishes."
+      else
+        WatchedFolderScanJob.perform_later(manual: true)
+        redirect_to admin_detected_imports_path, notice: "Watched-folder scan started."
       end
     end
 
@@ -78,9 +85,8 @@ module Admin
     end
 
     # Reverse a completed import so it can be re-imported against a different
-    # match (e.g. approved as a new book by mistake). Removes the published
-    # library file (returning it to the watched folder when it was moved) and
-    # returns the detection to the queue.
+    # match. Removes the published library file — returning it to the watched
+    # folder if it was moved — and puts the detection back in the queue.
     def undo
       unless @detected_import.imported?
         redirect_to admin_detected_imports_path, alert: "This item hasn't been imported, so there's nothing to undo."
@@ -96,10 +102,9 @@ module Admin
         alert: "Could not undo the import for \"#{@detected_import.display_title}\"."
     end
 
-    # Manual free-text metadata search from the review page, for when neither the
-    # suggestion nor the auto-detected alternates are right. Matches are merged
-    # into the detection's candidate list so they become selectable radios in the
-    # existing import form.
+    # Manual free-text search, for when neither the suggestion nor the alternates
+    # are right. Matches merge into the detection's candidate list so they become
+    # selectable radios in the existing import form.
     def search
       query = params[:query].to_s.strip
       if query.blank?
@@ -129,11 +134,10 @@ module Admin
     # Re-run identification against the source, refreshing the suggestion and
     # alternates (useful after adding a metadata provider or API key).
     #
-    # Reads the source exactly the way the scanner did: embedded metadata comes
-    # from the release's own audio file (the detection itself is the containing
-    # folder for an audiobook), while the filename parse falls back to the
-    # release name. Re-matching on the folder alone would discard the embedded
-    # tags and could replace a good suggestion with a filename-only guess.
+    # Reads the source exactly as the scanner did: embedded metadata from the
+    # release's own audio file, filename parse from the release name. Re-matching
+    # on the folder alone would discard the tags and could replace a good
+    # suggestion with a filename-only guess.
     def rematch
       identification = LibraryAcquisitionService.identify(
         source_path: WatchedFolderScanService.metadata_path_for(@detected_import.source_path),
@@ -153,20 +157,40 @@ module Admin
       redirect_to admin_detected_import_path(@detected_import), alert: "Could not re-match this item."
     end
 
+    # The row is the only thing suppressing re-detection of its source: the
+    # scanner recognises a file by the (device, inode) or path on a
+    # DetectedImport, so removing one whose file is still in the watched folder
+    # puts it back at the top of the queue — with a fresh notification — on the
+    # next scan. Removal is for pruning entries whose source is gone; while it is
+    # still there, the dismissal is what keeps it out.
     def destroy
+      if source_present?(@detected_import)
+        redirect_to admin_detected_imports_path,
+          alert: "\"#{@detected_import.display_title}\" is still in your watched folder, so the next scan would " \
+                 "detect it again. It stays dismissed and out of the review queue for as long as this entry exists."
+        return
+      end
+
       @detected_import.destroy
       redirect_to admin_detected_imports_path, notice: "Removed detection."
     end
 
     private
 
+    # Whether the file is still where the scanner found it. Only presence
+    # matters, so no identity is passed and an unreadable path counts as present
+    # — refusing to remove an entry is recoverable, resurrecting one is not.
+    def source_present?(detected_import)
+      FileCopyService.path_identity_state(detected_import.source_path.to_s) != :absent
+    end
+
     def set_detected_import
       @detected_import = DetectedImport.find(params[:id])
     end
 
-    # Prepend fresh manual-search hits ahead of the existing candidates, dropping
-    # any prior online entry for the same work so repeated searches don't stack
-    # duplicates. Library candidates (no work_id) are always preserved.
+    # Prepend fresh search hits, dropping any prior online entry for the same
+    # work so repeated searches don't stack duplicates. Library candidates (no
+    # work_id) are always preserved.
     def merge_candidates(existing, incoming)
       incoming_work_ids = incoming.filter_map { |candidate| candidate["work_id"] }.to_set
       retained = existing.reject do |candidate|
@@ -175,21 +199,20 @@ module Admin
       incoming + retained
     end
 
-    # A row wedged in "importing" is actionable only because its lease expired,
-    # and DetectedImportJob#claim recognises that by the row's age. Everything
-    # below — applying a selection, the job's own claim — touches updated_at,
-    # which would push the row back inside the lease window and make the claim
-    # fail silently. Retire the dead lease first: "failed" is claimable outright
-    # and keeps the record of the interrupted attempt visible in the queue.
+    # A wedged "importing" row is actionable only because its lease expired, which
+    # DetectedImportJob#claim recognises by the row's age. Everything below —
+    # applying a selection, the job's own claim — touches updated_at, pushing the
+    # row back inside the lease window and making the claim fail silently. Retire
+    # the dead lease first: "failed" is claimable outright and keeps the
+    # interrupted attempt visible in the queue.
     #
-    # Returns false when the row could not be retired because a worker really is
-    # importing it, so the caller can say so instead of flashing "Import queued".
+    # False when the row could not be retired because a worker really is importing
+    # it, so the caller can say so instead of flashing "Import queued".
     def reclaim_stuck_import!(detected_import)
       return true unless detected_import.stuck_importing?
 
-      reclaimed = DetectedImport
-        .where(id: detected_import.id, status: "importing")
-        .where("updated_at < ?", DetectedImport::STUCK_IMPORTING_AFTER.ago)
+      reclaimed = DetectedImport.stuck_importing
+        .where(id: detected_import.id)
         .update_all(
           status: "failed",
           error_message: "The previous import was interrupted before it finished.",
@@ -201,8 +224,8 @@ module Admin
       true
     end
 
-    # Resolve the user's decision from the approve form into the detection's
-    # target book. Defaults to the existing suggestion when no selection is made.
+    # Resolve the approve form's decision into the detection's target book,
+    # defaulting to the existing suggestion when nothing was selected.
     def apply_selection!(detected_import)
       selection = params[:selection].to_s
 
@@ -221,6 +244,9 @@ module Admin
 
     def apply_metadata_edits!(detected_import)
       attrs = { suggested_book_id: nil }
+      # The two guards differ on purpose: a blank title is a slip (nothing left
+      # to name the book by) so the parse stands, while a blank author is an
+      # instruction — the only way to clear an author the parse invented.
       attrs[:parsed_title] = params[:title].to_s.strip if params[:title].present?
       attrs[:parsed_author] = params[:author].to_s.strip if params.key?(:author)
       if DetectedImport::BOOK_TYPES.include?(params[:book_type])
@@ -229,9 +255,9 @@ module Admin
       detected_import.update!(attrs)
     end
 
-    # Resolve an online candidate (by work_id) to a Book, reusing an existing
-    # record when one already carries that work_id, otherwise creating one from
-    # the candidate metadata already captured at detection time (no network).
+    # Resolve an online candidate to a Book, reusing an existing record with that
+    # work_id or creating one from the metadata captured at detection (no
+    # network).
     def resolve_work_candidate(detected_import, work_id)
       book_type = detected_import.book_type.presence || "ebook"
       existing = Book.find_by_work_id(work_id, book_type: book_type)

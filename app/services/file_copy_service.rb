@@ -750,6 +750,31 @@ class FileCopyService
       end
     end
 
+    # Where a path stands relative to a (device, inode) recorded for it earlier.
+    #
+    #   :absent    - nothing occupies the path
+    #   :match     - the recorded file is still there
+    #   :mismatch  - a different file occupies it, or the identity cannot be
+    #                proven (none recorded, or the path could not be read)
+    #
+    # Unprovable reports :mismatch on purpose: callers use this to decide whether
+    # they may consume or overwrite a path, and the safe answer to "I cannot
+    # tell" is "leave it alone". Callers needing only presence pass no identity
+    # and read anything but :absent as occupied.
+    #
+    # A bare lstat, not a pinned traversal — callers gate the destructive work
+    # itself on the pinned primitives above.
+    def path_identity_state(path, device: nil, inode: nil)
+      stat = File.lstat(path.to_s)
+      return :mismatch if device.blank? || inode.blank?
+
+      [ stat.dev, stat.ino ] == [ device.to_i, inode.to_i ] ? :match : :mismatch
+    rescue Errno::ENOENT, Errno::ENOTDIR
+      :absent
+    rescue SystemCallError
+      :mismatch
+    end
+
     # Remove a directory child that still has the expected (device, inode).
     #
     # +expected_entries+ pins the tree the caller believes it is deleting, in the
